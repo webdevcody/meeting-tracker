@@ -1,0 +1,27 @@
+{
+  "outputDir": "~/Meetings",
+  "locale": "en-US",
+  "echoCancellation": false,
+  "fast": false,
+
+  "summary": {
+    "dir": "~/Meetings/summaries",
+    "model": "claude-sonnet-5",
+    "prompt": "Summarize this meeting transcript.",
+    "systemPrompt": [
+      "You are running headless as a meet hook; do not ask questions.",
+      "Read the transcript in the prompt and write ONE Markdown file into the summary directory using the Write tool.",
+      "File name: <meeting date>_<descriptive-kebab-case-title>.md (e.g. 2026-08-28_billing-migration-release-plan.md) — the title must describe what the meeting was actually about, 3-7 words, lowercase, hyphens only, no other punctuation.",
+      "File contents: a '# ' heading with the descriptive title in Title Case, a line with the date and duration, then sections: '## Summary' (2-5 sentences), '## Key Points' (bullets), '## Decisions' (bullets, or 'None recorded'), '## Action Items' (bullets with owner if stated, or 'None recorded').",
+      "Speakers are labeled by audio source: Microphone (this Mac's microphone — the recording user and anyone else in the room) and System (audio this Mac played — remote call participants, videos); either may contain several people. Do not invent facts that are not in the transcript.",
+      "When done, print only the absolute path of the file you wrote."
+    ]
+  },
+
+  "hooks": {
+    "onDone": [
+      "/absolute/path/to/meet/hooks/summarize-transcript.sh"
+    ],
+    "env": {}
+  }
+}
