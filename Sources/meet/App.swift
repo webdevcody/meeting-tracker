@@ -6,11 +6,12 @@ import Speech
 @main
 struct MeetingTracker: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
-        commandName: "meet",
+        commandName: "meet-rec",
         abstract: "Record microphone and/or system audio, transcribe on-device, then run hooks.",
         discussion: """
-        Running with no subcommand records a meeting (same as `meet record`).
-        Use `meet init` to create a config file.
+        This is the recording engine behind `meet`: the `meet` TUI spawns `meet-rec record --json`
+        and turns the transcript into action items. Running meet-rec directly with no subcommand
+        records a meeting (same as `meet-rec record`). Use `meet-rec init` to create a config file.
         """,
         subcommands: [Record.self, Init.self],
         defaultSubcommand: Record.self
@@ -79,6 +80,9 @@ struct Record: AsyncParsableCommand {
     @Flag(help: "Verbose logging.")
     var verbose = false
 
+    @Flag(help: "Emit newline-delimited JSON events on stdout (segments, status, lifecycle) for a parent process such as the meet TUI; human-readable output moves to stderr.")
+    var json = false
+
     /// Config file merged with CLI overrides.
     func effectiveConfig() throws -> Config {
         var cfg = try Config.load(from: config)
@@ -102,6 +106,7 @@ struct Record: AsyncParsableCommand {
 
     func run() async throws {
         signal(SIGPIPE, SIG_IGN)
+        if json { Events.enable() }
 
         let cfg = try effectiveConfig()
         // Fail on a bad prompt file now, not after an hour of recording.
@@ -112,7 +117,8 @@ struct Record: AsyncParsableCommand {
             print(try cfg.prettyJSON())
             return
         }
-        print("Config: \(cfg.configPath ?? "(built-in defaults; run `meet init` to create one)")")
+        note("Config: \(cfg.configPath ?? "(built-in defaults; run `meet-rec init` to create one)")")
+        Events.emit("config", ["path": cfg.configPath ?? "", "outputDir": expandTilde(cfg.outputDir)])
 
         // Sources (mic / system / both) and the microphone permission
         guard !(noMic && noSystem) else {
@@ -171,10 +177,13 @@ struct Record: AsyncParsableCommand {
             transcribers.append(t)
         }
 
-        print("Recording to \(meetingDir.path)")
-        print("Sources: \(recorder.sources.map(\.label).joined(separator: ", ")) · locale \(speechLocale.identifier)")
-        if let duration { print("Auto-stop after \(duration)s") }
-        fflush(stdout)
+        note("Recording to \(meetingDir.path)")
+        note("Sources: \(recorder.sources.map(\.label).joined(separator: ", ")) · locale \(speechLocale.identifier)")
+        if let duration { note("Auto-stop after \(duration)s") }
+        Events.emit("started", ["meetingDir": meetingDir.path,
+                                "sources": recorder.sources.map(\.rawValue),
+                                "locale": speechLocale.identifier,
+                                "startedAt": ISO8601DateFormatter().string(from: startedAt)])
 
         // Terminal + controls
         Terminal.enableRaw()
@@ -278,8 +287,7 @@ struct Record: AsyncParsableCommand {
         var tracksKept = false
         do {
             if recorder.sources.count > 1 {
-                print("Merging audio…")
-                fflush(stdout)
+                note("Merging audio…")
                 if keepTracks {
                     try AudioMixer.mix(trackURLs, into: audioURL)
                     tracksKept = true
@@ -309,22 +317,27 @@ struct Record: AsyncParsableCommand {
                                       segments: await session.segments)
 
         let segCount = await session.segments.count
-        print("Saved \(output.meetingDir.path)")
-        print("  duration \(Output.humanDuration(elapsed)), \(segCount) segment(s)")
+        note("Saved \(output.meetingDir.path)")
+        note("  duration \(Output.humanDuration(elapsed)), \(segCount) segment(s)")
         if mergedAudio != nil {
             let audioSecs = recorder.sources.map { recorder.seconds(for: $0) }.max() ?? 0
-            print("  \(Output.audioFileName)  \(Output.humanDuration(audioSecs))")
+            note("  \(Output.audioFileName)  \(Output.humanDuration(audioSecs))")
         }
         for source in recorder.sources where recorder.paddedSeconds(for: source) >= 1 {
-            print("  (\(source.rawValue) delivered no audio for \(Output.humanDuration(recorder.paddedSeconds(for: source))); filled with silence to stay in sync)")
+            note("  (\(source.rawValue) delivered no audio for \(Output.humanDuration(recorder.paddedSeconds(for: source))); filled with silence to stay in sync)")
         }
         if tracksKept {
             for source in recorder.sources {
-                print("  \(source.rawValue).m4a  \(Output.humanDuration(recorder.seconds(for: source)))")
+                note("  \(source.rawValue).m4a  \(Output.humanDuration(recorder.seconds(for: source)))")
             }
         }
-        print("  transcript.md, transcript.json, meta.json")
-        fflush(stdout)
+        note("  transcript.md, transcript.json, meta.json")
+        Events.emit("finished", ["meetingDir": output.meetingDir.path,
+                                 "durationSecs": elapsed,
+                                 "segmentCount": segCount,
+                                 "transcriptPath": output.transcriptMD.path,
+                                 "transcriptJsonPath": output.transcriptJSON.path,
+                                 "audioPath": mergedAudio?.path ?? ""])
 
         if !noHooks, !cfg.hooks.onDone.isEmpty {
             let iso = ISO8601DateFormatter()

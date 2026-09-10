@@ -6,8 +6,7 @@ enum Hooks {
     static func run(_ commands: [String], env extra: [String: String], cwd: URL, stdin text: String) async {
         Terminal.restore()
         for (i, command) in commands.enumerated() {
-            print("→ hook[\(i + 1)]: \(command)")
-            fflush(stdout)
+            note("→ hook[\(i + 1)]: \(command)")
             let status = await runOne(command, env: extra, cwd: cwd, stdin: text)
             if status != 0 {
                 log("⚠ hook[\(i + 1)] exited \(status)")
@@ -23,7 +22,9 @@ enum Hooks {
         process.currentDirectoryURL = cwd
         let pipe = Pipe()
         process.standardInput = pipe
-        // stdout/stderr inherit -> hook output streams to the terminal
+        // stdout/stderr inherit -> hook output streams to the terminal. In --json mode
+        // stdout belongs to the event stream, so the hook's output joins ours on stderr.
+        if Events.enabled { process.standardOutput = FileHandle.standardError }
 
         return await withCheckedContinuation { continuation in
             process.terminationHandler = { p in

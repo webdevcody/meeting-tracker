@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["crates/meet"]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+
+[profile.release]
+lto = "thin"
+strip = "debuginfo"
+opt-level = "z"
+codegen-units = 1

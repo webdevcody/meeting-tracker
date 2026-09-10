@@ -98,6 +98,36 @@ struct SummaryConfig: Codable, Sendable {
     }
 }
 
+/// The `meet` TUI's block: how the implementing agents run. The engine never acts on it; it
+/// is decoded here so `--show-config` and `meet init` round-trip it.
+struct AgentConfig: Codable, Sendable {
+    /// Model for the implementing agent (`"default"` or unset: Claude's own).
+    var model: String?
+    /// One more instruction for the agent when it is about to finish, delivered through a
+    /// Claude Code Stop hook. String or array of lines. `{{title}}`, `{{branch}}`,
+    /// `{{worktree}}`, `{{repo}}`, `{{run_dir}}` … are filled in per run.
+    var onDone: String?
+    /// Read `onDone` from this file instead (relative paths resolve against the config file).
+    var onDoneFile: String?
+
+    enum CodingKeys: String, CodingKey {
+        case model, onDone, onDoneFile
+    }
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        model = try c.decodeIfPresent(String.self, forKey: .model)
+        if let s = try? c.decodeIfPresent(String.self, forKey: .onDone) {
+            onDone = s
+        } else if let lines = try c.decodeIfPresent([String].self, forKey: .onDone) {
+            onDone = lines.joined(separator: "\n")
+        }
+        onDoneFile = try c.decodeIfPresent(String.self, forKey: .onDoneFile)
+    }
+}
+
 struct Config: Codable, Sendable {
     var outputDir: String = "~/Meetings"
     var locale: String = "en-US"
@@ -105,12 +135,13 @@ struct Config: Codable, Sendable {
     var fast: Bool = false
     var summary: SummaryConfig = SummaryConfig()
     var hooks: HooksConfig = HooksConfig()
+    var agent: AgentConfig = AgentConfig()
 
     /// Path the config was loaded from (nil = built-in defaults). Not serialized.
     var configPath: String? = nil
 
     enum CodingKeys: String, CodingKey {
-        case outputDir, locale, echoCancellation, fast, summary, hooks
+        case outputDir, locale, echoCancellation, fast, summary, hooks, agent
     }
 
     static let envVar = "MEET_CONFIG"
@@ -147,6 +178,7 @@ struct Config: Codable, Sendable {
         fast = try c.decodeIfPresent(Bool.self, forKey: .fast) ?? false
         summary = try c.decodeIfPresent(SummaryConfig.self, forKey: .summary) ?? SummaryConfig()
         hooks = try c.decodeIfPresent(HooksConfig.self, forKey: .hooks) ?? HooksConfig()
+        agent = try c.decodeIfPresent(AgentConfig.self, forKey: .agent) ?? AgentConfig()
     }
 
     /// Loads the config file. Resolution order:
@@ -189,6 +221,7 @@ struct Config: Codable, Sendable {
         summary.promptFile = summary.promptFile.map { resolvePath($0, base: base) }
         summary.systemPromptFile = summary.systemPromptFile.map { resolvePath($0, base: base) }
         summary.claudePath = summary.claudePath.map { $0.contains("/") ? resolvePath($0, base: base) : $0 }
+        agent.onDoneFile = agent.onDoneFile.map { resolvePath($0, base: base) }
     }
 
     /// Absolute path of the summary directory (`summary.dir` or `<outputDir>/summaries`).

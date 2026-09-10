@@ -37,7 +37,7 @@ actor Session {
     private let sources: [Source]
 
     init(sources: [Source]) {
-        self.showStatus = Terminal.stdoutIsTTY
+        self.showStatus = Terminal.stdoutIsTTY && !Events.enabled
         self.sources = sources
     }
 
@@ -66,6 +66,7 @@ actor Session {
             pauseStart = Date()
             paused = true
         }
+        Events.emit("paused", ["paused": paused, "elapsed": elapsed])
         draw()
         return paused
     }
@@ -92,12 +93,20 @@ actor Session {
     func add(_ segment: Segment) {
         segments.append(segment)
         counts[segment.source, default: 0] += 1
-        print("\r\u{1B}[2K\(segment.source.label): \(segment.text)")
+        if Events.enabled {
+            Events.emit("segment", ["source": segment.source.rawValue,
+                                    "text": segment.text,
+                                    "start": segment.start,
+                                    "end": segment.end])
+        } else {
+            print("\r\u{1B}[2K\(segment.source.label): \(segment.text)")
+        }
         draw()
     }
 
     /// Temporary status shown instead of the recording line (e.g. model download).
     func setStatus(_ text: String?) {
+        if text != statusText { Events.emit("status", ["text": text ?? ""]) }
         statusText = text
         draw()
     }

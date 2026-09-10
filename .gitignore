@@ -2,3 +2,5 @@
 *.xcodeproj
 .swiftpm/
 .DS_Store
+target/
+meetings/

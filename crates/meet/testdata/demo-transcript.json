@@ -1,0 +1,60 @@
+{
+  "startedAt": "2026-09-05T10:00:00Z",
+  "durationSecs": 65.0,
+  "segments": [
+    {
+      "source": "mic",
+      "text": "Okay so I'm looking at the todo script today and there are a couple of things I want to get done.",
+      "start": 0.0,
+      "end": 5.5
+    },
+    {
+      "source": "mic",
+      "text": "First one, the list command just prints plain text lines. I want a dash dash json flag on list so that other tools can parse it, like one JSON object per line with the id, the text and whether it's done.",
+      "start": 6.0,
+      "end": 17.5
+    },
+    {
+      "source": "mic",
+      "text": "Keep the plain text output exactly as it is when the flag isn't passed, I use that all the time.",
+      "start": 18.0,
+      "end": 23.5
+    },
+    {
+      "source": "mic",
+      "text": "Second thing, adding a todo with spaces in it is broken. If I run todo add fix the login bug it only saves the word fix. It should take everything after add as the text.",
+      "start": 24.0,
+      "end": 35.5
+    },
+    {
+      "source": "mic",
+      "text": "That's a real bug, people hit it all the time, let's fix that today.",
+      "start": 36.0,
+      "end": 40.5
+    },
+    {
+      "source": "system",
+      "text": "Yeah I hit that yesterday. Also, unrelated, did you see the game last night?",
+      "start": 41.0,
+      "end": 45.5
+    },
+    {
+      "source": "mic",
+      "text": "Ha, no, I was heads down. Anyway.",
+      "start": 46.0,
+      "end": 51.5
+    },
+    {
+      "source": "mic",
+      "text": "One more small thing, the readme doesn't mention the done command at all. Let's document it, just a short section with an example.",
+      "start": 52.0,
+      "end": 59.5
+    },
+    {
+      "source": "mic",
+      "text": "And I think that's it for this one. Let's ship the JSON flag first, that unblocks the dashboard.",
+      "start": 60.0,
+      "end": 65.0
+    }
+  ]
+}
