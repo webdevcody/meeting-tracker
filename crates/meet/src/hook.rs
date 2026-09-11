@@ -43,7 +43,7 @@ pub fn stop_hook_command(exe: &Path) -> String {
     )
 }
 
-fn shell_quote(s: &str) -> String {
+pub(crate) fn shell_quote(s: &str) -> String {
     if !s.is_empty()
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"/._-+".contains(&b))

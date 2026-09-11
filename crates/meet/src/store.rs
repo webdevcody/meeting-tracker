@@ -3,6 +3,7 @@
 //! with everything an agent run leaves behind (branch, worktree, Claude session id, PR URL,
 //! log). One mutex-guarded connection — the write volume is a few rows a minute.
 
+use crate::lookup::Fact;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
@@ -65,6 +66,14 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX segments_meeting ON segments (meeting_id, id);
     ALTER TABLE action_items ADD COLUMN session_id TEXT;
     ALTER TABLE action_items ADD COLUMN phase TEXT NOT NULL DEFAULT 'agent';
+    ",
+    // 3: the action items are written once the meeting ends, from the whole transcript,
+    // so the meeting itself carries the summary they came from; a chunk keeps the facts
+    // the live lookup found for it (a JSON array), so a past session's Related pane can
+    // be read back.
+    "
+    ALTER TABLE meetings ADD COLUMN summary TEXT;
+    ALTER TABLE chunks ADD COLUMN facts TEXT;
     ",
 ];
 
@@ -169,6 +178,7 @@ pub struct ChunkRow {
     pub end_secs: f64,
     pub text: String,
     pub summary: Option<String>,
+    pub facts: Vec<Fact>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -179,8 +189,9 @@ pub struct MeetingRow {
     pub started_at: i64,
     pub ended_at: Option<i64>,
     pub segment_count: i64,
-    /// The first chunk summary, as the meeting's one-line description.
-    pub first_summary: Option<String>,
+    /// The summary written when the meeting ended, else its first chunk summary — the
+    /// meeting's description, and the context its action items' agents get.
+    pub summary: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -275,6 +286,14 @@ impl Store {
         Ok(())
     }
 
+    pub fn set_meeting_summary(&self, id: &str, summary: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE meetings SET summary = ?2 WHERE id = ?1",
+            params![id, summary],
+        )?;
+        Ok(())
+    }
+
     pub fn end_meeting(&self, id: &str, segment_count: i64) -> Result<()> {
         self.conn.lock().unwrap().execute(
             "UPDATE meetings SET ended_at = ?2, segment_count = ?3 WHERE id = ?1",
@@ -304,8 +323,9 @@ impl Store {
                     CASE WHEN m.ended_at IS NULL
                          THEN (SELECT COUNT(*) FROM segments WHERE meeting_id = m.id)
                          ELSE m.segment_count END,
-                    (SELECT summary FROM chunks WHERE meeting_id = m.id AND summary IS NOT NULL
-                       ORDER BY idx LIMIT 1)
+                    COALESCE(m.summary,
+                      (SELECT summary FROM chunks WHERE meeting_id = m.id AND summary IS NOT NULL
+                         ORDER BY idx LIMIT 1))
              FROM meetings m WHERE m.repo_path = ?1
              ORDER BY m.started_at DESC, m.rowid DESC LIMIT 500",
         )?;
@@ -317,7 +337,7 @@ impl Store {
                 started_at: r.get(3)?,
                 ended_at: r.get(4)?,
                 segment_count: r.get(5)?,
-                first_summary: r.get(6)?,
+                summary: r.get(6)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -386,10 +406,19 @@ impl Store {
         Ok(())
     }
 
+    pub fn set_chunk_facts(&self, id: &str, facts: &[Fact]) -> Result<()> {
+        let json = serde_json::to_string(facts)?;
+        self.conn.lock().unwrap().execute(
+            "UPDATE chunks SET facts = ?2 WHERE id = ?1",
+            params![id, json],
+        )?;
+        Ok(())
+    }
+
     pub fn get_chunk(&self, id: &str) -> Result<Option<ChunkRow>> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT id, meeting_id, idx, start_secs, end_secs, text, summary FROM chunks WHERE id = ?1",
+            "SELECT id, meeting_id, idx, start_secs, end_secs, text, summary, facts FROM chunks WHERE id = ?1",
             params![id],
             row_to_chunk,
         )
@@ -397,11 +426,11 @@ impl Store {
         .map_err(Into::into)
     }
 
-    /// A meeting's chunks in order, summaries included.
+    /// A meeting's chunks in order, summaries and facts included.
     pub fn list_chunks(&self, meeting_id: &str) -> Result<Vec<ChunkRow>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, meeting_id, idx, start_secs, end_secs, text, summary FROM chunks
+            "SELECT id, meeting_id, idx, start_secs, end_secs, text, summary, facts FROM chunks
              WHERE meeting_id = ?1 ORDER BY idx",
         )?;
         let rows = stmt.query_map(params![meeting_id], row_to_chunk)?;
@@ -554,6 +583,10 @@ fn row_to_chunk(r: &rusqlite::Row<'_>) -> rusqlite::Result<ChunkRow> {
         end_secs: r.get(4)?,
         text: r.get(5)?,
         summary: r.get(6)?,
+        facts: r
+            .get::<_, Option<String>>(7)?
+            .and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or_default(),
     })
 }
 
@@ -589,10 +622,15 @@ mod tests {
         let meeting = store.insert_meeting("/repo").unwrap();
         let chunk = store.insert_chunk(&meeting, 0, 0.0, 30.0, "hello").unwrap();
         store.set_chunk_summary(&chunk, "said hello").unwrap();
-        assert_eq!(
-            store.get_chunk(&chunk).unwrap().unwrap().summary.as_deref(),
-            Some("said hello")
-        );
+        let row = store.get_chunk(&chunk).unwrap().unwrap();
+        assert_eq!(row.summary.as_deref(), Some("said hello"));
+        assert!(row.facts.is_empty(), "no facts yet");
+        let facts = vec![Fact {
+            text: "README says hello".into(),
+            where_: "README.md:1".into(),
+        }];
+        store.set_chunk_facts(&chunk, &facts).unwrap();
+        assert_eq!(store.get_chunk(&chunk).unwrap().unwrap().facts, facts);
 
         let a = store
             .insert_item(
@@ -701,9 +739,13 @@ mod tests {
         assert!(meetings[1].ended_at.is_some(), "stale meeting was closed");
         assert_eq!(meetings[1].segment_count, 2);
         assert_eq!(
-            meetings[1].first_summary.as_deref(),
-            Some("greetings and a decision")
+            meetings[1].summary.as_deref(),
+            Some("greetings and a decision"),
+            "the first chunk summary stands in until the meeting has its own"
         );
+        store.set_meeting_summary(&m1, "the whole thing").unwrap();
+        let meetings = store.list_meetings("/repo").unwrap();
+        assert_eq!(meetings[1].summary.as_deref(), Some("the whole thing"));
         assert_eq!(meetings[0].ended_at, None, "the live meeting stays open");
     }
 
@@ -746,5 +788,8 @@ mod tests {
         assert_eq!(items[0].session_id, None);
         assert_eq!(items[0].phase, RunPhase::Agent);
         assert_eq!(items[0].status, ItemStatus::Running);
+        let meetings = s.list_meetings("/r").unwrap();
+        assert_eq!(meetings[0].summary, None);
+        s.set_meeting_summary("m", "s").unwrap();
     }
 }

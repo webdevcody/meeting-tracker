@@ -1,9 +1,9 @@
 //! Drawing: a header with the recording clock, the live transcript (or a past session's)
-//! and its chunk summaries on the left, the action items and the selected item's prompt on
-//! the right, a footer of keys — and the overlays (agent log, typed note, quit and stop
-//! confirms, the session list, help).
+//! and its chunk summaries on the left, and on the right either the facts the lookup found
+//! (Related) or the action items with the selected one's prompt, a footer of keys — and
+//! the overlays (agent log, typed note, quit / stop / end confirms, the session list, help).
 
-use crate::app::{App, ChunkState, Overlay, RecState};
+use crate::app::{App, ChunkState, Overlay, RecState, RightPane, WrapUp};
 use crate::chunker::clock;
 use crate::store::{ActionItem, ItemStatus, MeetingRow, RunPhase};
 use crate::theme::Theme;
@@ -38,14 +38,20 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_transcript(f, app, left[0]);
     draw_summaries(f, app, left[1]);
 
-    let visible = app.visible_items().len();
-    let items_h = (visible as u16 + 2).clamp(4, cols[1].height.saturating_mul(45) / 100);
-    let right = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(items_h), Constraint::Min(4)])
-        .split(cols[1]);
-    draw_items(f, app, right[0]);
-    draw_detail(f, app, right[1]);
+    match app.right_pane {
+        RightPane::Related => draw_related(f, app, cols[1]),
+        RightPane::Items => {
+            let visible = app.visible_items().len();
+            let items_h =
+                (visible as u16 + 2).clamp(4, cols[1].height.saturating_mul(45) / 100);
+            let right = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(items_h), Constraint::Min(4)])
+                .split(cols[1]);
+            draw_items(f, app, right[0]);
+            draw_detail(f, app, right[1]);
+        }
+    }
 
     draw_footer(f, app, rows[2]);
     if app.overlay.is_some() {
@@ -310,8 +316,10 @@ fn draw_summaries(f: &mut Frame, app: &App, area: Rect) {
             "this session has no summaries"
         } else if app.suggest_disabled {
             "suggestions are off (--no-suggest)"
+        } else if app.lookup_disabled {
+            "lookups are off (--no-lookup)"
         } else {
-            "each minute or so of talk becomes a summary here, and action items on the right"
+            "each minute or so of talk becomes a summary here, and related facts on the right"
         };
         lines.push(Line::from(Span::styled(hint, Style::default().fg(th.dim))));
     }
@@ -320,7 +328,7 @@ fn draw_summaries(f: &mut Frame, app: &App, area: Rect) {
         let (text, style) = match (&c.state, &c.summary) {
             (ChunkState::Done, Some(s)) => (s.clone(), Style::default().fg(th.text)),
             (ChunkState::Summarizing, _) => {
-                ("summarizing…".to_string(), Style::default().fg(th.warn))
+                ("looking up…".to_string(), Style::default().fg(th.warn))
             }
             (ChunkState::Queued, _) => (
                 format!("queued ({} words)", c.words),
@@ -356,6 +364,98 @@ fn draw_summaries(f: &mut Frame, app: &App, area: Rect) {
     };
     let visible: Vec<Line> = lines.into_iter().skip(skip).take(h).collect();
     f.render_widget(Paragraph::new(visible), inner);
+}
+
+/// The facts the lookup found, newest at the bottom; follows the newest unless scrolled.
+fn draw_related(f: &mut Frame, app: &mut App, area: Rect) {
+    let th = app.theme;
+    let facts = app.shown_facts();
+    let looking_up = app.looking_up().filter(|_| app.session.is_none());
+    let t = match (facts.len(), looking_up) {
+        (0, None) => "Related".to_string(),
+        (n, None) => format!("Related · {n}"),
+        (n, Some(idx)) => format!("Related · {n} · looking up #{}", idx + 1),
+    };
+    let b = block(title(&t, th), th);
+    let inner = b.inner(area);
+    f.render_widget(b, area);
+    if inner.width < 8 || inner.height == 0 {
+        return;
+    }
+    let width = inner.width as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    if facts.is_empty() {
+        let hint = if app.session.is_some() {
+            "nothing was looked up in this session"
+        } else if app.suggest_disabled {
+            "suggestions are off (--no-suggest)"
+        } else if app.lookup_disabled {
+            "lookups are off (--no-lookup)"
+        } else {
+            "as you talk, what this repository says about it lands here — files, flags, how things work today. Tab shows the action items."
+        };
+        for w in wrap(hint, width) {
+            lines.push(Line::from(Span::styled(w, Style::default().fg(th.dim))));
+        }
+    }
+    let mut last_chunk = None;
+    for fact in facts {
+        let head = if last_chunk == Some(fact.chunk_idx) {
+            " ".repeat(6)
+        } else {
+            format!("{} ", clock(fact.at))
+        };
+        last_chunk = Some(fact.chunk_idx);
+        let hlen = head.chars().count();
+        let body_w = width.saturating_sub(hlen).max(8);
+        for (i, w) in wrap(&fact.text, body_w).into_iter().enumerate() {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    if i == 0 {
+                        head.clone()
+                    } else {
+                        " ".repeat(hlen)
+                    },
+                    Style::default().fg(th.dim),
+                ),
+                Span::styled(w, Style::default().fg(th.text)),
+            ]));
+        }
+        if !fact.where_.is_empty() {
+            for w in wrap(&fact.where_, body_w) {
+                lines.push(Line::from(vec![
+                    Span::raw(" ".repeat(hlen)),
+                    Span::styled(w, Style::default().fg(th.accent)),
+                ]));
+            }
+        }
+    }
+    let total = lines.len();
+    let h = inner.height as usize;
+    let max_scroll = total.saturating_sub(h);
+    let scroll = match app.related_scroll {
+        Some(s) if s < max_scroll => s,
+        Some(_) => {
+            app.related_scroll = None;
+            max_scroll
+        }
+        None => max_scroll,
+    };
+    let visible: Vec<Line> = lines.into_iter().skip(scroll).take(h).collect();
+    f.render_widget(Paragraph::new(visible), inner);
+    if app.related_scroll.is_some() {
+        let tag = " ↓ ] to follow ";
+        let r = Rect {
+            x: area.x + area.width.saturating_sub(tag.len() as u16 + 1),
+            y: area.y,
+            width: tag.len() as u16,
+            height: 1,
+        };
+        f.render_widget(
+            Paragraph::new(Span::styled(tag, Style::default().fg(th.warn))),
+            r,
+        );
+    }
 }
 
 fn status_span(item: &ActionItem, app: &App) -> Span<'static> {
@@ -403,12 +503,14 @@ fn draw_items(f: &mut Frame, app: &App, area: Rect) {
     let th = app.theme;
     let visible = app.visible_items();
     let running = app.visible_count(ItemStatus::Running);
+    let writing = app.session.is_none() && app.wrap_up == WrapUp::Writing;
     let t = match (&app.session, running) {
         (Some(_), 0) => format!("Action items · {} from this session", visible.len()),
         (Some(_), r) => format!(
             "Action items · {} from this session · {r} running",
             visible.len()
         ),
+        (None, _) if writing => "Action items · writing…".to_string(),
         (None, 0) => format!("Action items · {}", visible.len()),
         (None, r) => format!("Action items · {r} running"),
     };
@@ -425,12 +527,39 @@ fn draw_items(f: &mut Frame, app: &App, area: Rect) {
         .min(visible.len().saturating_sub(h));
     let mut lines: Vec<Line> = Vec::new();
     if visible.is_empty() {
-        let hint = if app.session.is_some() {
-            "this session produced no action items"
+        let (hint, style) = if app.session.is_some() {
+            (
+                "this session produced no action items".to_string(),
+                Style::default().fg(th.dim),
+            )
         } else {
-            "nothing yet — talk about what should change and suggestions land here"
+            match &app.wrap_up {
+                _ if app.suggest_disabled => (
+                    "suggestions are off (--no-suggest)".to_string(),
+                    Style::default().fg(th.dim),
+                ),
+                WrapUp::NotYet => (
+                    "the action items are written when the recording stops — x stops it"
+                        .to_string(),
+                    Style::default().fg(th.dim),
+                ),
+                WrapUp::Writing => (
+                    "writing the action items from the transcript…".to_string(),
+                    Style::default().fg(th.warn),
+                ),
+                WrapUp::Done => (
+                    "no action items came out of this meeting".to_string(),
+                    Style::default().fg(th.dim),
+                ),
+                WrapUp::Failed(e) => (
+                    format!("could not write the action items: {e} — s tries again"),
+                    Style::default().fg(th.err),
+                ),
+            }
         };
-        lines.push(Line::from(Span::styled(hint, Style::default().fg(th.dim))));
+        for w in wrap(&hint, inner.width as usize) {
+            lines.push(Line::from(Span::styled(w, style)));
+        }
     }
     for (row, &idx) in visible.iter().enumerate().skip(first).take(h) {
         let item = &app.items[idx];
@@ -579,17 +708,21 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let hints = match &app.overlay {
         Some(Overlay::Log { .. }) => "↑/↓ scroll  G follow  Esc close",
         Some(Overlay::Note { .. }) => "type a note into the transcript  Enter add  Esc cancel",
+        Some(Overlay::ConfirmQuit { live: true, .. }) => {
+            "y quit without action items  x stop the recording and stay  n stay"
+        }
         Some(Overlay::ConfirmQuit { .. }) => "y quit  n stay",
         Some(Overlay::ConfirmStop { .. }) => "y stop the agent  n keep it running",
+        Some(Overlay::ConfirmEnd) => "y stop the recording  n keep recording",
         Some(Overlay::Sessions { .. }) => "↑/↓ pick a session  Enter view  Esc close",
         Some(Overlay::Help) => "Esc close",
         None => {
             if app.session.is_some() {
-                "Esc live  ←/→ session  Enter run/resume  X stop  l log  o open PR  ? help  q quit"
+                "Esc live  ←/→ session  Tab related/items  Enter run/resume  X stop agent  l log  o open PR  ? help  q quit"
             } else if app.is_live() {
-                "Enter run  X stop  d dismiss  l log  o PR  S sessions  i note  s summarize  space pause  ? help  q quit"
+                "x stop recording  a ask  Tab related/items  Enter run  X stop agent  d dismiss  i note  s look up now  space pause  ? help  q quit"
             } else {
-                "Enter run  X stop  d dismiss  l log  o open PR  S sessions  ←/→ session  ? help  q quit"
+                "a ask  Tab related/items  Enter run  X stop agent  d dismiss  l log  o open PR  S sessions  ←/→ session  ? help  q quit"
             }
         }
     };
@@ -601,15 +734,18 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         None => Span::styled(format!(" {hints}"), Style::default().fg(th.muted)),
     };
     let mut right_parts: Vec<String> = Vec::new();
-    if let Some(idx) = app.suggesting() {
+    if let Some(idx) = app.looking_up() {
         let q = app.queued();
         right_parts.push(if q > 0 {
-            format!("✎ summarizing #{} · {q} queued", idx + 1)
+            format!("⌕ looking up #{} · {q} queued", idx + 1)
         } else {
-            format!("✎ summarizing #{}", idx + 1)
+            format!("⌕ looking up #{}", idx + 1)
         });
     } else if app.queued() > 0 {
-        right_parts.push(format!("✎ {} queued", app.queued()));
+        right_parts.push(format!("⌕ {} queued", app.queued()));
+    }
+    if app.wrap_up == WrapUp::Writing {
+        right_parts.push("✎ writing action items".into());
     }
     let running = app.running_count();
     if running > 0 {
@@ -685,7 +821,7 @@ pub fn session_row(m: &MeetingRow, live: bool, items: &[ActionItem], width: usiz
         parts.push(s);
     }
     let mut row = parts.join(" · ");
-    if let Some(sum) = &m.first_summary {
+    if let Some(sum) = &m.summary {
         let room = width.saturating_sub(row.chars().count() + 4);
         if room > 12 {
             row.push_str("  — ");
@@ -774,10 +910,10 @@ fn draw_overlay(f: &mut Frame, app: &mut App, area: Rect) {
                 inner,
             );
         }
-        Overlay::ConfirmQuit { running } => {
+        Overlay::ConfirmQuit { running, live } => {
             let r = centered(area, 60, 20);
             let r = Rect {
-                height: 6.min(r.height),
+                height: 7.min(r.height),
                 ..r
             };
             f.render_widget(Clear, r);
@@ -793,13 +929,34 @@ fn draw_overlay(f: &mut Frame, app: &mut App, area: Rect) {
                     if running == 1 { "it" } else { "them" },
                 ));
             }
-            if app.is_live() {
-                msg.push("The recording stops and the transcript is saved first.".into());
+            if live {
+                msg.push(
+                    "The recording is still going. y stops it, saves the transcript and quits — no action items are written. x stops the recording and stays, so the action items land here first."
+                        .into(),
+                );
             }
             let p = Paragraph::new(msg.join(" "))
                 .style(Style::default().fg(th.text))
                 .wrap(Wrap { trim: true })
                 .alignment(Alignment::Left);
+            f.render_widget(p, inner);
+        }
+        Overlay::ConfirmEnd => {
+            let r = centered(area, 60, 20);
+            let r = Rect {
+                height: 6.min(r.height),
+                ..r
+            };
+            f.render_widget(Clear, r);
+            let b = block(title("Stop the recording?", th), th)
+                .border_style(Style::default().fg(th.warn));
+            let inner = b.inner(r);
+            f.render_widget(b, r);
+            let p = Paragraph::new(
+                "The transcript and audio are saved, the engine's hooks run, and Claude writes the action items from everything that was said. The recording cannot be started again; meet stays open to run the items.",
+            )
+            .style(Style::default().fg(th.text))
+            .wrap(Wrap { trim: true });
             f.render_widget(p, inner);
         }
         Overlay::ConfirmStop { item_id } => {
@@ -873,6 +1030,15 @@ fn draw_overlay(f: &mut Frame, app: &mut App, area: Rect) {
             let inner = b.inner(r);
             f.render_widget(b, r);
             let keys = [
+                (
+                    "x",
+                    "stop the recording and stay: the action items are written from the transcript",
+                ),
+                (
+                    "a",
+                    "ask questions: a Claude Code session over the live transcript (nebula, tmux, or `meet ask` elsewhere)",
+                ),
+                ("Tab", "flip the right pane: related facts / action items"),
                 ("j / k, ↓ / ↑", "select an action item"),
                 (
                     "Enter",
@@ -885,13 +1051,16 @@ fn draw_overlay(f: &mut Frame, app: &mut App, area: Rect) {
                 ("S", "the session list: every meeting held in this repo"),
                 ("← / →", "step to an older / newer session; Esc back to live"),
                 ("i", "type a note into the transcript"),
-                ("s", "summarize what is pending now"),
+                (
+                    "s",
+                    "look up what is pending now; once ended, write the action items again",
+                ),
                 ("space", "pause / resume the recording"),
                 (
                     "PgUp / PgDn, J / K",
                     "scroll the transcript; G follows again",
                 ),
-                ("[ / ]", "scroll the prompt pane"),
+                ("[ / ]", "scroll the right pane"),
                 (
                     "q, Ctrl+C",
                     "quit; running agents resume when meet starts here again",
@@ -924,7 +1093,7 @@ mod tests {
             started_at: 1_756_000_000,
             ended_at: Some(1_756_000_000 + 2520),
             segment_count: 128,
-            first_summary: Some("Decided to ship the JSON flag.".into()),
+            summary: Some("Decided to ship the JSON flag.".into()),
         };
         let mk = |id: &str, status| ActionItem {
             id: id.into(),

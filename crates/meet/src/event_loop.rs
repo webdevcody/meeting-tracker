@@ -1,16 +1,26 @@
-//! The loop: keys from the terminal, events from the recorder, the suggester and the agent
-//! runs, and a one-second tick, all on one `tokio::select!`; redraws when something changed.
+//! The loop: keys from the terminal, events from the recorder, the live lookup, the
+//! suggester and the agent runs, and a one-second tick, all on one `tokio::select!`;
+//! redraws when something changed.
 //!
-//! On launch, agents the last `meet` took down with it are resumed before anything else
-//! (unless `--no-resume`); on quit, running agents get a SIGTERM so Claude flushes their
-//! sessions, and their rows stay `running` for the next launch to pick up.
+//! While the recording goes, every closed chunk is looked up (summary + related facts).
+//! `x` stops the recording and stays: the whole transcript then goes to the suggester
+//! once, and the action items land on the board. On launch, agents the last `meet` took
+//! down with it are resumed before anything else (unless `--no-resume`); on quit, running
+//! agents get a SIGTERM so Claude flushes their sessions, and their rows stay `running`
+//! for the next launch to pick up.
 
-use crate::app::{App, ChunkState, Overlay, RecState, SessionView, TranscriptLine};
+use crate::app::{
+    fact_views, App, ChunkState, Overlay, RecState, RightPane, SessionView, TranscriptLine,
+    WrapUp,
+};
+use crate::ask::{self, AskContext, AskEvent, Opened};
 use crate::chunker::{Chunk, Limits};
+use crate::live::{self, LiveFiles};
+use crate::lookup::{self, LookupConfig, LookupEvent, LookupRequest};
 use crate::recorder::{self, RecorderEvent, RecorderHandle, Segment};
 use crate::runner::{spawn_run, RunContext, RunEvent};
 use crate::store::{ActionItem, ItemStatus, Store};
-use crate::suggest::{spawn_worker, SuggestEvent, SuggestRequest, SuggesterConfig};
+use crate::suggest::{self, SuggestEvent, SuggestRequest, SuggesterConfig};
 use crate::{config, git, ui};
 use anyhow::{Context, Result};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
@@ -34,9 +44,16 @@ pub struct Opts {
     pub config: Option<String>,
     pub claude_bin: String,
     pub gh_bin: String,
+    pub lookup_model: Option<String>,
+    pub lookup_effort: Option<String>,
+    pub lookup_budget_usd: f64,
+    pub no_lookup: bool,
     pub suggest_model: Option<String>,
     pub agent_model: Option<String>,
     pub suggest_budget_usd: f64,
+    /// The question session's model and effort (`a`, `meet ask`).
+    pub ask_model: Option<String>,
+    pub ask_effort: Option<String>,
     pub no_suggest: bool,
     /// Leave interrupted agents stopped instead of resuming them on launch.
     pub no_resume: bool,
@@ -56,13 +73,24 @@ const AGENT_EXIT_GRACE: Duration = Duration::from_millis(1500);
 struct Loop {
     app: App,
     store: Store,
+    /// The transcript and summary files under `<data dir>/sessions/<meeting id>/`, for
+    /// the question session; `None` when the directory could not be created.
+    live: Option<LiveFiles>,
     recorder: RecorderHandle,
-    suggest_tx: mpsc::UnboundedSender<SuggestRequest>,
+    lookup_tx: mpsc::UnboundedSender<LookupRequest>,
+    suggest_cfg: SuggesterConfig,
+    suggest_tx: mpsc::UnboundedSender<SuggestEvent>,
     run_tx: mpsc::UnboundedSender<RunEvent>,
     run_ctx: RunContext,
+    ask_tx: mpsc::UnboundedSender<AskEvent>,
+    ask_model: Option<String>,
+    ask_effort: Option<String>,
     /// item id → the stop switch of its running agent.
     stops: HashMap<String, watch::Sender<bool>>,
+    /// Set by a quit while recording: leave once the engine has finished, no action items.
     finalize_deadline: Option<tokio::time::Instant>,
+    /// Set by `x`: give up waiting for the engine's `finished` after this and wrap up anyway.
+    stop_deadline: Option<tokio::time::Instant>,
 }
 
 pub async fn run(opts: Opts) -> Result<()> {
@@ -94,19 +122,22 @@ pub async fn run(opts: Opts) -> Result<()> {
         }
     };
 
-    let (suggest_tx, suggest_rx) = mpsc::unbounded_channel::<SuggestRequest>();
-    let (suggest_ev_tx, mut suggest_ev_rx) = mpsc::unbounded_channel::<SuggestEvent>();
-    let _suggester = spawn_worker(
-        SuggesterConfig {
+    let (lookup_tx, lookup_rx) = mpsc::unbounded_channel::<LookupRequest>();
+    let (lookup_ev_tx, mut lookup_ev_rx) = mpsc::unbounded_channel::<LookupEvent>();
+    let _lookup = lookup::spawn_worker(
+        LookupConfig {
             claude_bin: opts.claude_bin.clone(),
-            model: opts.suggest_model.clone(),
+            model: opts.lookup_model.clone(),
+            effort: opts.lookup_effort.clone(),
             repo: repo.clone(),
-            max_budget_usd: opts.suggest_budget_usd,
+            max_budget_usd: opts.lookup_budget_usd,
         },
-        suggest_rx,
-        suggest_ev_tx,
+        lookup_rx,
+        lookup_ev_tx,
     );
+    let (suggest_tx, mut suggest_rx) = mpsc::unbounded_channel::<SuggestEvent>();
     let (run_tx, mut run_rx) = mpsc::unbounded_channel::<RunEvent>();
+    let (ask_tx, mut ask_rx) = mpsc::unbounded_channel::<AskEvent>();
 
     let mut app = App::new(
         repo.clone(),
@@ -117,15 +148,42 @@ pub async fn run(opts: Opts) -> Result<()> {
         items,
     );
     app.sessions = sessions;
+    app.lookup_disabled = opts.no_lookup || opts.no_suggest;
     app.suggest_disabled = opts.no_suggest;
     if let Some(p) = &cfg.path {
         app.push_log(format!("agent config: {}", p.display()));
     }
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("meet"));
+    let started = app
+        .sessions
+        .first()
+        .map(|m| crate::when::local_datetime(m.started_at))
+        .unwrap_or_default();
+    let live = match LiveFiles::create(
+        crate::paths::session_dir(&app.meeting_id),
+        &live::transcript_header(&app.repo_name, &started),
+    ) {
+        Ok(files) => {
+            app.push_log(format!("live transcript: {}", files.transcript_path().display()));
+            Some(files)
+        }
+        Err(e) => {
+            app.push_log(format!("⚠ no live transcript file: {e:#}"));
+            None
+        }
+    };
     let mut lp = Loop {
         app,
         store,
+        live,
         recorder,
+        lookup_tx,
+        suggest_cfg: SuggesterConfig {
+            claude_bin: opts.claude_bin.clone(),
+            model: opts.suggest_model.clone(),
+            repo: repo.clone(),
+            max_budget_usd: opts.suggest_budget_usd,
+        },
         suggest_tx,
         run_tx,
         run_ctx: RunContext {
@@ -139,8 +197,12 @@ pub async fn run(opts: Opts) -> Result<()> {
             on_done: opts.on_done.clone().or(cfg.agent.on_done.clone()),
             exe,
         },
+        ask_tx,
+        ask_model: opts.ask_model.clone(),
+        ask_effort: opts.ask_effort.clone(),
         stops: HashMap::new(),
         finalize_deadline: None,
+        stop_deadline: None,
     };
     if lp.run_ctx.on_done.is_some() {
         lp.app
@@ -174,6 +236,16 @@ pub async fn run(opts: Opts) -> Result<()> {
                         lp.app.should_quit = true;
                     }
                 }
+                if lp.stop_deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
+                    lp.stop_deadline = None;
+                    lp.app.push_log(
+                        "⚠ the recorder did not finish in time; the transcript so far is kept".into(),
+                    );
+                    if let Some(chunk) = lp.app.on_engine_exited(None) {
+                        lp.enqueue_chunk(chunk);
+                    }
+                    lp.wrap_up();
+                }
             }
             ev = input.next() => match ev {
                 Some(Ok(Event::Key(key))) => lp.on_key(key),
@@ -183,9 +255,12 @@ pub async fn run(opts: Opts) -> Result<()> {
                 None => break Ok(()),
             },
             ev = rec_rx.recv() => if let Some(ev) = ev { lp.on_recorder(ev) },
-            ev = suggest_ev_rx.recv() => if let Some(ev) = ev { lp.on_suggest(ev) },
+            ev = lookup_ev_rx.recv() => if let Some(ev) = ev { lp.on_lookup(ev) },
+            ev = suggest_rx.recv() => if let Some(ev) = ev { lp.on_suggest(ev) },
             ev = run_rx.recv() => if let Some(ev) = ev { lp.on_run(ev) },
+            ev = ask_rx.recv() => if let Some(ev) = ev { lp.on_ask(ev) },
         }
+        lp.flush_live();
         if lp.app.should_quit {
             break Ok(());
         }
@@ -264,13 +339,41 @@ impl Loop {
             self.app
                 .push_log(format!("⚠ could not save a transcript line: {e:#}"));
         }
+        if let Some(files) = &self.live {
+            let line = TranscriptLine {
+                at: seg.start,
+                source: seg.source.clone(),
+                text: seg.text.clone(),
+            };
+            if let Err(e) = files.append(&line) {
+                self.app
+                    .push_log(format!("⚠ could not append to the live transcript: {e:#}"));
+            }
+        }
         if let Some(chunk) = self.app.on_segment(seg) {
             self.enqueue_chunk(chunk);
         }
     }
 
+    /// Rewrite `summary.md` when what it describes changed.
+    fn flush_live(&mut self) {
+        if !self.app.live_stale {
+            return;
+        }
+        self.app.live_stale = false;
+        let Some(files) = &self.live else {
+            return;
+        };
+        let text = live::summary_text(&self.app, &files.transcript_path());
+        if let Err(e) = files.write_summary(&text) {
+            self.app
+                .push_log(format!("⚠ could not write the live summary: {e:#}"));
+        }
+    }
+
+    /// A closed chunk goes to the live lookup.
     fn enqueue_chunk(&mut self, chunk: Chunk) {
-        if self.app.suggest_disabled {
+        if self.app.lookup_disabled {
             return;
         }
         let idx = self.app.chunks.len() as i64;
@@ -287,16 +390,75 @@ impl Loop {
             }
         };
         let idx = self.app.add_chunk(id.clone(), &chunk);
-        let req = SuggestRequest {
+        let req = LookupRequest {
             chunk_id: id,
             chunk_idx: idx,
             chunk_text: text,
             start: chunk.start,
             end: chunk.end,
             summaries_so_far: self.app.summaries(),
-            board: self.app.board(),
+            facts_so_far: self.app.fact_lines(),
         };
-        let _ = self.suggest_tx.send(req);
+        let _ = self.lookup_tx.send(req);
+    }
+
+    /// The recording is over: the whole transcript goes to the suggester once, and the
+    /// board takes the right pane. Skipped when quitting, or when nothing was said.
+    fn wrap_up(&mut self) {
+        if self.app.wrap_up != WrapUp::NotYet || self.finalize_deadline.is_some() {
+            return;
+        }
+        if self.app.suggest_disabled {
+            self.app.wrap_up = WrapUp::Done;
+            return;
+        }
+        let transcript = self.app.transcript_text();
+        if transcript.trim().is_empty() {
+            self.app.wrap_up = WrapUp::Done;
+            self.app
+                .flash("nothing was said — no action items to write".into(), true);
+            return;
+        }
+        self.app.wrap_up = WrapUp::Writing;
+        self.app.live_stale = true;
+        if self.app.session.is_none() {
+            self.app.show_items();
+        }
+        suggest::spawn(
+            self.suggest_cfg.clone(),
+            SuggestRequest {
+                transcript,
+                summaries: self.app.summaries(),
+                facts: self.app.fact_lines(),
+                board: self.app.board(),
+            },
+            self.suggest_tx.clone(),
+        );
+        self.app.dirty = true;
+    }
+
+    /// Ask before stopping the recording — there is no starting it again.
+    fn confirm_end(&mut self) {
+        if !self.app.is_live() {
+            self.app
+                .flash("the recording has already ended".into(), true);
+            return;
+        }
+        self.app.overlay = Some(Overlay::ConfirmEnd);
+        self.app.dirty = true;
+    }
+
+    /// Stop the recording and stay: the engine finalizes, then the action items are written.
+    fn stop_recording(&mut self) {
+        self.app.overlay = None;
+        if !self.app.is_live() {
+            return;
+        }
+        self.app.rec = RecState::Finalizing;
+        self.app.status_text = Some("stopping the recording…".into());
+        self.recorder.stop();
+        self.stop_deadline = Some(tokio::time::Instant::now() + FINALIZE_FOR);
+        self.app.dirty = true;
     }
 
     fn on_recorder(&mut self, ev: RecorderEvent) {
@@ -326,6 +488,7 @@ impl Loop {
             RecorderEvent::Clock(secs) => self.app.on_clock(secs),
             RecorderEvent::Log(line) => self.app.push_log(line),
             RecorderEvent::Finished { meeting_dir, .. } => {
+                self.stop_deadline = None;
                 if !meeting_dir.is_empty() {
                     self.app.meeting_dir = Some(meeting_dir);
                 }
@@ -337,46 +500,78 @@ impl Loop {
                     None => "replay finished".into(),
                 };
                 self.app.flash(msg, false);
+                self.wrap_up();
             }
             RecorderEvent::Exited { code } => {
+                self.stop_deadline = None;
                 if let Some(chunk) = self.app.on_engine_exited(code) {
                     self.enqueue_chunk(chunk);
                 }
                 if self.finalize_deadline.take().is_some() {
                     self.app.should_quit = true;
+                } else {
+                    // Without a `finished` first, this is the engine dying: still write
+                    // the action items from what was heard.
+                    self.wrap_up();
                 }
+            }
+        }
+    }
+
+    fn on_lookup(&mut self, ev: LookupEvent) {
+        match ev {
+            LookupEvent::Started { chunk_id } => {
+                if let Some(c) = self.app.chunk_mut(&chunk_id) {
+                    c.state = ChunkState::Summarizing;
+                }
+                self.app.dirty = true;
+                self.app.live_stale = true;
+            }
+            LookupEvent::Done { chunk_id, lookup } => {
+                let _ = self.store.set_chunk_summary(&chunk_id, &lookup.summary);
+                let _ = self.store.set_chunk_facts(&chunk_id, &lookup.facts);
+                if let Some(m) = self.app.sessions.first_mut() {
+                    if m.summary.is_none() {
+                        m.summary = Some(lookup.summary.clone());
+                    }
+                }
+                self.app
+                    .on_lookup_done(&chunk_id, lookup.summary, &lookup.facts);
+            }
+            LookupEvent::Failed {
+                chunk_id,
+                chunk_idx,
+                error,
+            } => {
+                if let Some(c) = self.app.chunk_mut(&chunk_id) {
+                    c.state = ChunkState::Failed(crate::stream_json::excerpt(&error, 120));
+                }
+                self.app.live_stale = true;
+                self.app.push_log(format!(
+                    "⚠ lookup failed on chunk {}: {error}",
+                    chunk_idx + 1
+                ));
             }
         }
     }
 
     fn on_suggest(&mut self, ev: SuggestEvent) {
         match ev {
-            SuggestEvent::Started { chunk_id } => {
-                if let Some(c) = self.app.chunk_mut(&chunk_id) {
-                    c.state = ChunkState::Summarizing;
-                }
-                self.app.dirty = true;
-            }
-            SuggestEvent::Done {
-                chunk_id,
-                suggestion,
-            } => {
-                let _ = self.store.set_chunk_summary(&chunk_id, &suggestion.summary);
-                if let Some(c) = self.app.chunk_mut(&chunk_id) {
-                    c.summary = Some(suggestion.summary.clone());
-                    c.state = ChunkState::Done;
-                }
+            SuggestEvent::Done(suggestion) => {
+                let _ = self
+                    .store
+                    .set_meeting_summary(&self.app.meeting_id, &suggestion.summary);
+                self.app.meeting_summary = Some(suggestion.summary.clone());
+                self.app.live_stale = true;
                 if let Some(m) = self.app.sessions.first_mut() {
-                    if m.first_summary.is_none() {
-                        m.first_summary = Some(suggestion.summary.clone());
-                    }
+                    m.summary = Some(suggestion.summary.clone());
                 }
                 let repo_key = self.repo_key();
                 let mut new = Vec::new();
                 for s in &suggestion.items {
                     match self.store.insert_item(
                         &self.app.meeting_id,
-                        Some(&chunk_id),
+                        None,
                         &repo_key,
                         &s.title,
                         &s.prompt,
@@ -390,33 +585,25 @@ impl Loop {
                 }
                 let n = new.len();
                 self.app.insert_items(new);
-                if n > 0 {
-                    let where_ = if self.app.session.is_some() {
-                        " (on the live board)"
-                    } else {
-                        " — Enter runs the selected one"
-                    };
-                    self.app.flash(
-                        format!(
-                            "{n} new action item{}{where_}",
-                            if n == 1 { "" } else { "s" }
-                        ),
-                        false,
-                    );
-                }
+                self.app.wrap_up = WrapUp::Done;
+                let msg = match (n, self.app.session.is_some()) {
+                    (0, _) => "no action items came out of this meeting".to_string(),
+                    (n, true) => format!(
+                        "{n} action item{} on the live board",
+                        if n == 1 { "" } else { "s" }
+                    ),
+                    (n, false) => format!(
+                        "{n} action item{} — Enter runs the selected one",
+                        if n == 1 { "" } else { "s" }
+                    ),
+                };
+                self.app.flash(msg, false);
             }
-            SuggestEvent::Failed {
-                chunk_id,
-                chunk_idx,
-                error,
-            } => {
-                if let Some(c) = self.app.chunk_mut(&chunk_id) {
-                    c.state = ChunkState::Failed(crate::stream_json::excerpt(&error, 120));
-                }
-                self.app.push_log(format!(
-                    "⚠ summarizer failed on chunk {}: {error}",
-                    chunk_idx + 1
-                ));
+            SuggestEvent::Failed(error) => {
+                self.app.wrap_up = WrapUp::Failed(crate::stream_json::excerpt(&error, 160));
+                self.app.live_stale = true;
+                self.app
+                    .push_log(format!("⚠ could not write the action items: {error}"));
             }
         }
     }
@@ -504,7 +691,8 @@ impl Loop {
         }
     }
 
-    /// The chunk summary an item came from, for the agent's context.
+    /// What the item came from, for the agent's context: its meeting's summary, or (items
+    /// from before the summary was written per meeting) its chunk's.
     fn meeting_context_for(&self, item: &ActionItem) -> String {
         item.chunk_id
             .as_deref()
@@ -515,6 +703,13 @@ impl Loop {
                     .as_deref()
                     .and_then(|id| self.store.get_chunk(id).ok().flatten())
                     .and_then(|c| c.summary)
+            })
+            .or_else(|| {
+                self.app
+                    .sessions
+                    .iter()
+                    .find(|m| m.id == item.meeting_id)
+                    .and_then(|m| m.summary.clone())
             })
             .unwrap_or_default()
     }
@@ -602,6 +797,102 @@ impl Loop {
         self.app.dirty = true;
     }
 
+    // ----- the question session -----
+
+    /// `a`: a Claude Code session to ask about the meeting, opened where this `meet` can
+    /// (nebula, tmux) or named as the command to run elsewhere. One per launch.
+    fn ask(&mut self) {
+        if self.app.session.is_some() {
+            self.app
+                .flash("Esc back to the live meeting first".into(), true);
+            return;
+        }
+        if let Some(where_) = self.app.ask_where.clone() {
+            self.app.flash(
+                if where_.contains(" ask ") {
+                    format!("run in another terminal: {where_}")
+                } else {
+                    format!("the question session is already open {where_}")
+                },
+                false,
+            );
+            return;
+        }
+        let Some(files) = &self.live else {
+            self.app.flash(
+                "no live transcript file to ask about (see the log)".into(),
+                true,
+            );
+            return;
+        };
+        let ctx = AskContext {
+            repo: self.app.repo.clone(),
+            meeting_id: self.app.meeting_id.clone(),
+            session_dir: files.dir().to_path_buf(),
+            live: self.app.is_live(),
+        };
+        self.flush_live();
+        if let Err(e) = std::fs::write(ctx.system_file(), ask::system_prompt(&ctx)) {
+            self.app
+                .flash(format!("could not write the question prompt: {e}"), true);
+            return;
+        }
+        let launch = ask::Launch {
+            exe: self.run_ctx.exe.clone(),
+            claude_bin: self.run_ctx.claude_bin.clone(),
+            model: self.ask_model.clone(),
+            effort: self.ask_effort.clone(),
+            ctx,
+        };
+        let tx = self.ask_tx.clone();
+        tokio::spawn(async move {
+            let ev = match ask::open(&launch).await {
+                Ok(opened) => AskEvent::Opened(opened),
+                Err(e) => AskEvent::Failed(format!("{e:#}")),
+            };
+            let _ = tx.send(ev);
+        });
+        self.app
+            .flash("opening the question session…".into(), false);
+    }
+
+    fn on_ask(&mut self, ev: AskEvent) {
+        match ev {
+            AskEvent::Opened(Opened::Nebula) => {
+                self.app.ask_where = Some("beside this one in nebula".into());
+                self.app.push_log("question session started in nebula".into());
+                self.app.flash(
+                    "question session started beside this one in nebula — pick it from the session list".into(),
+                    false,
+                );
+            }
+            AskEvent::Opened(Opened::Tmux) => {
+                self.app.ask_where = Some("in the tmux pane beside meet".into());
+                self.app.push_log("question session opened in a tmux pane".into());
+                self.app.flash(
+                    "question session opened in a tmux pane beside meet".into(),
+                    false,
+                );
+            }
+            AskEvent::Opened(Opened::Manual(cmd)) => {
+                self.app.ask_where = Some(cmd.clone());
+                self.app
+                    .push_log(format!("question session: run in another terminal: {cmd}"));
+                self.app
+                    .flash(format!("run in another terminal: {cmd}"), false);
+            }
+            AskEvent::Failed(e) => {
+                self.app
+                    .push_log(format!("⚠ could not open the question session: {e}"));
+                self.app.flash(
+                    format!("could not open the question session: {}", crate::stream_json::excerpt(&e, 120)),
+                    true,
+                );
+            }
+        }
+        self.app.dirty = true;
+    }
+
     // ----- sessions -----
 
     fn open_sessions(&mut self) {
@@ -639,10 +930,12 @@ impl Loop {
                 return;
             }
         };
-        let chunks = self
-            .store
-            .list_chunks(&meeting.id)
-            .unwrap_or_default()
+        let rows = self.store.list_chunks(&meeting.id).unwrap_or_default();
+        let facts = rows
+            .iter()
+            .flat_map(|c| fact_views(c.idx.max(0) as usize, c.start_secs, &c.facts))
+            .collect();
+        let chunks = rows
             .into_iter()
             .map(|c| crate::app::ChunkView {
                 id: c.id,
@@ -663,6 +956,7 @@ impl Loop {
             meeting,
             transcript,
             chunks,
+            facts,
         });
         self.app.flash(
             format!("session {label} — ←/→ step, Esc back to live"),
@@ -767,8 +1061,9 @@ impl Loop {
 
     fn request_quit(&mut self) {
         let running = self.app.running_count();
-        if running > 0 || self.app.is_live() {
-            self.app.overlay = Some(Overlay::ConfirmQuit { running });
+        let live = self.app.is_live();
+        if running > 0 || live {
+            self.app.overlay = Some(Overlay::ConfirmQuit { running, live });
             self.app.dirty = true;
         } else {
             self.app.should_quit = true;
@@ -810,15 +1105,22 @@ impl Loop {
                     _ if ctrl_c => self.app.overlay = None,
                     _ => {}
                 },
-                Overlay::ConfirmQuit { .. } => match key.code {
+                Overlay::ConfirmQuit { live, .. } => match key.code {
                     KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => self.quit_now(),
                     KeyCode::Char('c') if ctrl_c => self.quit_now(),
+                    KeyCode::Char('x') | KeyCode::Char('X') if live => self.stop_recording(),
                     _ => self.app.overlay = None,
                 },
                 Overlay::ConfirmStop { item_id } => {
                     self.app.overlay = None;
                     if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter) {
                         self.stop_item(&item_id);
+                    }
+                }
+                Overlay::ConfirmEnd => {
+                    self.app.overlay = None;
+                    if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter) {
+                        self.stop_recording();
                     }
                 }
                 Overlay::Sessions { cursor } => match key.code {
@@ -907,14 +1209,17 @@ impl Loop {
             KeyCode::Char('j') | KeyCode::Down => self.app.select_next(),
             KeyCode::Char('k') | KeyCode::Up => self.app.select_prev(),
             KeyCode::Enter => self.run_selected(),
+            KeyCode::Char('x') => self.confirm_end(),
+            KeyCode::Tab => self.app.toggle_pane(),
             KeyCode::Char('X') => self.confirm_stop_selected(),
-            KeyCode::Char('d') | KeyCode::Char('x') => {
+            KeyCode::Char('d') => {
                 if let Some(id) = self.app.dismiss_selected() {
                     let _ = self.store.set_item_status(&id, ItemStatus::Dismissed);
                 }
             }
             KeyCode::Char('l') => self.open_log(),
             KeyCode::Char('o') => self.open_selected(),
+            KeyCode::Char('a') => self.ask(),
             KeyCode::Char('S') => self.open_sessions(),
             KeyCode::Left => self.step_session(1),
             KeyCode::Right => self.step_session(-1),
@@ -924,10 +1229,28 @@ impl Loop {
                 });
             }
             KeyCode::Char('s') => {
-                if self.app.chunker.pending_words() == 0 {
-                    self.app.flash("nothing pending to summarize".into(), true);
-                } else if let Some(chunk) = self.app.chunker.flush() {
-                    self.enqueue_chunk(chunk);
+                if self.app.is_live() {
+                    if self.app.lookup_disabled {
+                        self.app.flash("lookups are off".into(), true);
+                    } else if self.app.chunker.pending_words() == 0 {
+                        self.app.flash("nothing pending to look up".into(), true);
+                    } else if let Some(chunk) = self.app.chunker.flush() {
+                        self.enqueue_chunk(chunk);
+                    }
+                } else if self.app.session.is_some() {
+                    self.app
+                        .flash("Esc back to the live meeting first".into(), true);
+                } else if self.app.wrap_up == WrapUp::Writing {
+                    self.app
+                        .flash("the action items are being written".into(), true);
+                } else if self.app.suggest_disabled {
+                    self.app
+                        .flash("suggestions are off (--no-suggest)".into(), true);
+                } else {
+                    self.app.wrap_up = WrapUp::NotYet;
+                    self.app
+                        .flash("writing the action items again…".into(), false);
+                    self.wrap_up();
                 }
             }
             KeyCode::Char(' ') => {
@@ -945,8 +1268,23 @@ impl Loop {
                 }
             }
             KeyCode::Char('G') => self.app.transcript_scroll = None,
-            KeyCode::Char('[') => self.app.detail_scroll = self.app.detail_scroll.saturating_sub(3),
-            KeyCode::Char(']') => self.app.detail_scroll += 3,
+            KeyCode::Char('[') => match self.app.right_pane {
+                RightPane::Items => {
+                    self.app.detail_scroll = self.app.detail_scroll.saturating_sub(3)
+                }
+                RightPane::Related => {
+                    let cur = self.app.related_scroll.unwrap_or(usize::MAX / 2);
+                    self.app.related_scroll = Some(cur.saturating_sub(3));
+                }
+            },
+            KeyCode::Char(']') => match self.app.right_pane {
+                RightPane::Items => self.app.detail_scroll += 3,
+                RightPane::Related => {
+                    if let Some(s) = self.app.related_scroll {
+                        self.app.related_scroll = Some(s + 3);
+                    }
+                }
+            },
             KeyCode::Char('?') => self.app.overlay = Some(Overlay::Help),
             _ => {}
         }

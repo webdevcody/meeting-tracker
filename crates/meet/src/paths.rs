@@ -1,12 +1,13 @@
-//! Where `meet` keeps its own state: one SQLite database and one directory of agent run
-//! logs per user, like nebula — never inside the repository being worked on.
+//! Where `meet` keeps its own state: one SQLite database, one directory of agent run logs
+//! and one directory of live meeting files per user, like nebula — never inside the
+//! repository being worked on.
 //! `MEET_DATA_DIR` overrides everything (tests, a second instance).
 
 use std::path::PathBuf;
 
 pub const DATA_DIR_ENV: &str = "MEET_DATA_DIR";
 
-fn non_empty(var: &str) -> Option<String> {
+pub fn non_empty(var: &str) -> Option<String> {
     std::env::var(var).ok().filter(|v| !v.trim().is_empty())
 }
 
@@ -36,6 +37,16 @@ pub fn run_dir(item_id: &str) -> PathBuf {
     runs_dir().join(item_id)
 }
 
+/// One directory per meeting: the live transcript and the running summary, written as
+/// the meeting goes for anything outside the TUI (the question session) to read.
+pub fn sessions_dir() -> PathBuf {
+    data_dir().join("sessions")
+}
+
+pub fn session_dir(meeting_id: &str) -> PathBuf {
+    sessions_dir().join(meeting_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -48,6 +59,7 @@ mod tests {
         assert_eq!(data_dir(), dir);
         assert_eq!(db_path(), dir.join("meet.db"));
         assert_eq!(run_dir("abc"), dir.join("runs").join("abc"));
+        assert_eq!(session_dir("m1"), dir.join("sessions").join("m1"));
         match previous {
             Some(v) => std::env::set_var(DATA_DIR_ENV, v),
             None => std::env::remove_var(DATA_DIR_ENV),

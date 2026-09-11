@@ -38,6 +38,8 @@ pub struct Structured<'a> {
     pub bin: &'a str,
     pub cwd: &'a Path,
     pub model: Option<&'a str>,
+    /// `--effort`: how hard the model thinks (`low` for the live lookups).
+    pub effort: Option<&'a str>,
     pub system_prompt: &'a str,
     pub prompt: &'a str,
     pub schema: &'a str,
@@ -71,6 +73,9 @@ pub async fn structured(req: Structured<'_>) -> Result<Value> {
     }
     if let Some(m) = req.model {
         cmd.args(["--model", m]);
+    }
+    if let Some(e) = req.effort {
+        cmd.args(["--effort", e]);
     }
     let mut child = cmd.spawn().with_context(|| format!("start {}", req.bin))?;
     let mut stdin = child.stdin.take().context("claude stdin")?;

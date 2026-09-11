@@ -2,10 +2,12 @@
 //! suggester and runner events and key presses; `ui` draws it.
 //!
 //! Two views share the screen: the live meeting (what is being said now), and a past
-//! session picked from the list — its transcript and summaries on the left, the action
-//! items it produced on the right, with any agent still running on them updating live.
+//! session picked from the list — its transcript and summaries on the left, and on the
+//! right either the facts the live lookup found (Related) or the action items it produced,
+//! with any agent still running on them updating live. Tab flips the right pane.
 
 use crate::chunker::{Chunk, Chunker, Limits};
+use crate::lookup::Fact;
 use crate::recorder::Segment;
 use crate::store::{ActionItem, ItemStatus, MeetingRow, RunOutcome, RunPhase};
 use crate::theme::Theme;
@@ -32,6 +34,13 @@ pub struct TranscriptLine {
     pub text: String,
 }
 
+impl TranscriptLine {
+    /// `[mm:ss] source: text` — how a line is quoted to Claude and written to disk.
+    pub fn line(&self) -> String {
+        format!("[{}] {}: {}", crate::chunker::clock(self.at), self.source, self.text)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChunkState {
     Queued,
@@ -51,12 +60,65 @@ pub struct ChunkView {
     pub state: ChunkState,
 }
 
+/// One fact the live lookup found, tagged with the chunk it came from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FactView {
+    pub chunk_idx: usize,
+    /// Recording time the chunk started.
+    pub at: f64,
+    pub text: String,
+    pub where_: String,
+}
+
+impl FactView {
+    /// `text (where)` — how the fact is quoted back to Claude.
+    pub fn line(&self) -> String {
+        if self.where_.is_empty() {
+            self.text.clone()
+        } else {
+            format!("{} ({})", self.text, self.where_)
+        }
+    }
+}
+
+pub fn fact_views(chunk_idx: usize, at: f64, facts: &[Fact]) -> Vec<FactView> {
+    facts
+        .iter()
+        .map(|f| FactView {
+            chunk_idx,
+            at,
+            text: f.text.clone(),
+            where_: f.where_.clone(),
+        })
+        .collect()
+}
+
+/// What the right column shows.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RightPane {
+    /// The facts the live lookup found — the default while recording.
+    Related,
+    /// The action items and the selected one's prompt — the default once it ended.
+    Items,
+}
+
+/// Where the end-of-meeting action items are.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WrapUp {
+    /// The recording is still going (or was skipped).
+    NotYet,
+    Writing,
+    Done,
+    Failed(String),
+}
+
 /// A past session loaded for viewing.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionView {
     pub meeting: MeetingRow,
     pub transcript: Vec<TranscriptLine>,
     pub chunks: Vec<ChunkView>,
+    pub facts: Vec<FactView>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -72,13 +134,17 @@ pub enum Overlay {
     Note {
         input: String,
     },
+    /// `live`: the recording is still going, so quitting skips the action items.
     ConfirmQuit {
         running: usize,
+        live: bool,
     },
     /// Stop the agent working on this item?
     ConfirmStop {
         item_id: String,
     },
+    /// Stop the recording (and write the action items)?
+    ConfirmEnd,
     /// The session list; `cursor` indexes `App::sessions` (0 is the live meeting).
     Sessions {
         cursor: usize,
@@ -110,6 +176,14 @@ pub struct App {
     pub transcript_scroll: Option<usize>,
     pub chunker: Chunker,
     pub chunks: Vec<ChunkView>,
+    /// What the lookup found for the live meeting, in the order it landed.
+    pub facts: Vec<FactView>,
+    /// `None` follows the newest fact; `Some(n)` is a manual scroll position (in lines).
+    pub related_scroll: Option<usize>,
+    pub right_pane: RightPane,
+    pub wrap_up: WrapUp,
+    /// The live meeting's summary, once its action items were written.
+    pub meeting_summary: Option<String>,
     /// Every session held in this repo, newest first; index 0 is the live one.
     pub sessions: Vec<MeetingRow>,
     /// A past session on screen instead of the live meeting.
@@ -123,11 +197,18 @@ pub struct App {
     pub activity: HashMap<String, String>,
     pub overlay: Option<Overlay>,
     pub flash: Option<(String, Instant, bool)>,
-    /// Engine stderr, hook output, suggester errors — the last few hundred lines.
+    /// Engine stderr, hook output, lookup and suggester errors — the last few hundred lines.
     pub log: Vec<String>,
+    /// `--no-lookup`: no live lookups (the action items are still written at the end).
+    pub lookup_disabled: bool,
+    /// `--no-suggest`: transcribe only.
     pub suggest_disabled: bool,
     pub dirty: bool,
     pub should_quit: bool,
+    /// The on-disk `summary.md` (see `live`) no longer matches what is on screen.
+    pub live_stale: bool,
+    /// Where the question session (`a`) was opened, or the command that opens one.
+    pub ask_where: Option<String>,
 }
 
 pub const FLASH_FOR: Duration = Duration::from_secs(6);
@@ -163,6 +244,11 @@ impl App {
             transcript_scroll: None,
             chunker: Chunker::new(limits),
             chunks: Vec::new(),
+            facts: Vec::new(),
+            related_scroll: None,
+            right_pane: RightPane::Related,
+            wrap_up: WrapUp::NotYet,
+            meeting_summary: None,
             sessions: Vec::new(),
             session: None,
             items,
@@ -172,9 +258,12 @@ impl App {
             overlay: None,
             flash: None,
             log: Vec::new(),
+            lookup_disabled: false,
             suggest_disabled: false,
             dirty: true,
             should_quit: false,
+            live_stale: true,
+            ask_where: None,
         }
     }
 
@@ -215,6 +304,7 @@ impl App {
         }
         self.status_text = None;
         self.dirty = true;
+        self.live_stale = true;
     }
 
     pub fn on_status(&mut self, text: String) {
@@ -256,6 +346,7 @@ impl App {
             _ => {}
         }
         self.dirty = true;
+        self.live_stale = true;
     }
 
     pub fn on_finished(&mut self) -> Option<Chunk> {
@@ -266,6 +357,7 @@ impl App {
         self.rec = RecState::Ended;
         self.status_text = None;
         self.dirty = true;
+        self.live_stale = true;
         self.chunker.flush()
     }
 
@@ -292,6 +384,7 @@ impl App {
             }
         ));
         self.dirty = true;
+        self.live_stale = true;
         self.chunker.flush()
     }
 
@@ -337,11 +430,26 @@ impl App {
             state: ChunkState::Queued,
         });
         self.dirty = true;
+        self.live_stale = true;
         idx
     }
 
     pub fn chunk_mut(&mut self, id: &str) -> Option<&mut ChunkView> {
         self.chunks.iter_mut().find(|c| c.id == id)
+    }
+
+    /// The lookup answered for a chunk: its summary lands under the transcript, its facts
+    /// in the Related pane.
+    pub fn on_lookup_done(&mut self, chunk_id: &str, summary: String, facts: &[Fact]) {
+        let Some(c) = self.chunk_mut(chunk_id) else {
+            return;
+        };
+        c.summary = Some(summary);
+        c.state = ChunkState::Done;
+        let (idx, at) = (c.idx, c.start);
+        self.facts.extend(fact_views(idx, at, facts));
+        self.dirty = true;
+        self.live_stale = true;
     }
 
     pub fn summaries(&self) -> Vec<String> {
@@ -351,6 +459,19 @@ impl App {
             .collect()
     }
 
+    pub fn fact_lines(&self) -> Vec<String> {
+        self.facts.iter().map(FactView::line).collect()
+    }
+
+    /// The whole live transcript as the suggester reads it, `[mm:ss] source: text` per line.
+    pub fn transcript_text(&self) -> String {
+        self.transcript
+            .iter()
+            .map(TranscriptLine::line)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     pub fn board(&self) -> Vec<String> {
         self.items
             .iter()
@@ -358,11 +479,38 @@ impl App {
             .collect()
     }
 
-    pub fn suggesting(&self) -> Option<usize> {
+    /// The chunk the lookup is on right now.
+    pub fn looking_up(&self) -> Option<usize> {
         self.chunks
             .iter()
             .find(|c| c.state == ChunkState::Summarizing)
             .map(|c| c.idx)
+    }
+
+    // ----- the right pane -----
+
+    pub fn toggle_pane(&mut self) {
+        self.right_pane = match self.right_pane {
+            RightPane::Related => RightPane::Items,
+            RightPane::Items => RightPane::Related,
+        };
+        self.related_scroll = None;
+        self.detail_scroll = 0;
+        self.dirty = true;
+    }
+
+    pub fn show_items(&mut self) {
+        self.right_pane = RightPane::Items;
+        self.detail_scroll = 0;
+        self.dirty = true;
+    }
+
+    /// The facts on screen: the live meeting's, or the viewed session's.
+    pub fn shown_facts(&self) -> &[FactView] {
+        match &self.session {
+            Some(v) => &v.facts,
+            None => &self.facts,
+        }
     }
 
     pub fn queued(&self) -> usize {
@@ -391,7 +539,9 @@ impl App {
         let keep = self.selected_item().map(|i| i.id.clone());
         self.session = Some(view);
         self.transcript_scroll = None;
+        self.related_scroll = None;
         self.detail_scroll = 0;
+        self.right_pane = RightPane::Items;
         self.reselect(keep);
         self.dirty = true;
     }
@@ -401,7 +551,13 @@ impl App {
         let keep = self.selected_item().map(|i| i.id.clone());
         self.session = None;
         self.transcript_scroll = None;
+        self.related_scroll = None;
         self.detail_scroll = 0;
+        self.right_pane = if self.is_live() {
+            RightPane::Related
+        } else {
+            RightPane::Items
+        };
         self.reselect(keep);
         self.dirty = true;
     }
@@ -471,6 +627,7 @@ impl App {
         }
         self.reselect(keep);
         self.dirty = true;
+        self.live_stale = true;
     }
 
     pub fn select_next(&mut self) {
@@ -503,6 +660,7 @@ impl App {
             self.selected = n.saturating_sub(1);
         }
         self.dirty = true;
+        self.live_stale = true;
         Some(id)
     }
 
@@ -530,6 +688,7 @@ impl App {
             item.error = None;
         }
         self.dirty = true;
+        self.live_stale = true;
     }
 
     pub fn on_run_session(&mut self, id: &str, session_id: String) {
@@ -564,6 +723,7 @@ impl App {
             item.error = out.error.clone();
         }
         self.dirty = true;
+        self.live_stale = true;
     }
 
     /// One line in the footer for a few seconds; newlines and runs of spaces collapse.
@@ -612,7 +772,7 @@ mod tests {
             started_at: 0,
             ended_at: Some(60),
             segment_count: 0,
-            first_summary: None,
+            summary: None,
         }
     }
 
@@ -763,8 +923,16 @@ mod tests {
                 text: "earlier".into(),
             }],
             chunks: vec![],
+            facts: vec![FactView {
+                chunk_idx: 0,
+                at: 0.0,
+                text: "old fact".into(),
+                where_: String::new(),
+            }],
         });
         assert_eq!(app.session_index(), 1);
+        assert_eq!(app.right_pane, RightPane::Items, "a session opens on its items");
+        assert_eq!(app.shown_facts()[0].text, "old fact");
         assert_eq!(app.visible_items(), vec![1, 2]);
         assert_eq!(
             app.selected_item().unwrap().id,
@@ -798,6 +966,7 @@ mod tests {
             meeting: meeting("older"),
             transcript: vec![],
             chunks: vec![],
+            facts: vec![],
         });
         assert!(app.visible_items().is_empty());
         assert_eq!(app.selected_item(), None);
@@ -807,5 +976,60 @@ mod tests {
         assert_eq!(app.visible_items().len(), 4);
         assert_eq!(app.selected, 0);
         assert!(app.shown_transcript().is_empty(), "the live transcript again");
+        assert_eq!(
+            app.right_pane,
+            RightPane::Related,
+            "back to the live meeting, which is still starting: the Related pane"
+        );
+    }
+
+    #[test]
+    fn the_lookup_fills_the_summary_and_the_related_pane_and_the_suggester_gets_it_all() {
+        let mut app = fresh();
+        app.on_started(String::new(), vec!["mic".into()]);
+        app.on_segment(Segment {
+            source: "mic".into(),
+            text: "does list print json".into(),
+            start: 3.0,
+            end: 5.0,
+        });
+        let chunk = app.chunker.flush().unwrap();
+        app.add_chunk("c1".into(), &chunk);
+        app.on_lookup_done(
+            "c1",
+            "asked about json".into(),
+            &[
+                Fact {
+                    text: "list prints plain text".into(),
+                    where_: "todo.sh:18".into(),
+                },
+                Fact {
+                    text: "no --json flag".into(),
+                    where_: String::new(),
+                },
+            ],
+        );
+        assert_eq!(app.chunks[0].state, ChunkState::Done);
+        assert_eq!(app.summaries(), vec!["asked about json".to_string()]);
+        assert_eq!(app.facts.len(), 2);
+        assert_eq!(app.facts[0].at, 3.0);
+        assert_eq!(
+            app.fact_lines(),
+            vec![
+                "list prints plain text (todo.sh:18)".to_string(),
+                "no --json flag".to_string()
+            ]
+        );
+        assert_eq!(app.transcript_text(), "[00:03] mic: does list print json");
+        app.on_lookup_done("nope", "x".into(), &[]);
+        assert_eq!(app.facts.len(), 2, "an unknown chunk changes nothing");
+
+        assert_eq!(app.right_pane, RightPane::Related);
+        app.toggle_pane();
+        assert_eq!(app.right_pane, RightPane::Items);
+        app.toggle_pane();
+        assert_eq!(app.right_pane, RightPane::Related);
+        app.show_items();
+        assert_eq!(app.right_pane, RightPane::Items);
     }
 }

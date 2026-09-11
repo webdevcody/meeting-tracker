@@ -1,9 +1,12 @@
-//! `meet` — talk to your repo. Run it in a git checkout: the recorder listens, the
-//! transcript becomes summaries and action items, Enter sends an action item to a
-//! headless Claude Code agent in its own worktree, and the agent's work comes back as a
-//! pull request. Every session is kept; agents cut off by a quit resume on the next launch.
+//! `meet` — talk to your repo. Run it in a git checkout: the recorder listens, a fast
+//! Claude looks up what the codebase says about what is being discussed as it goes, and
+//! when the recording stops the transcript becomes action items. Enter sends an action
+//! item to a headless Claude Code agent in its own worktree, and the agent's work comes
+//! back as a pull request. Every session is kept; agents cut off by a quit resume on the
+//! next launch.
 
 mod app;
+mod ask;
 mod branch_name;
 mod chunker;
 mod claude;
@@ -11,6 +14,8 @@ mod config;
 mod event_loop;
 mod git;
 mod hook;
+mod live;
+mod lookup;
 mod paths;
 mod pr_body;
 mod recorder;
@@ -34,12 +39,15 @@ use std::path::PathBuf;
     about = "Talk to your repo: live transcript → action items → Claude Code agents → pull requests.",
     long_about = "Run `meet` (or `meet .`) inside a git checkout. It records the microphone and system audio \
 through the meet-rec engine, transcribes on-device, and every minute or so hands the newest chunk of \
-transcript to a headless Claude that writes a summary and proposes action items — each one a fully \
-specified prompt. Select an item and press Enter: meet creates a git worktree on a new branch, runs a \
-Claude Code agent in it, commits, pushes, and opens a pull request with `gh`. State lives in a SQLite \
-database per user: every session's transcript, summaries and action items are kept (S lists them), \
-and an agent that was running when meet quit is resumed on the next launch in the same repo.",
-    after_help = "Examples:\n  meet                          record in the current repo\n  meet ~/code/app --no-system   microphone only, in another checkout\n  meet --replay meetings/2026-09-04_10-00/transcript.json --replay-speed 8\n                                replay a saved transcript instead of recording\n  meet --no-resume              leave interrupted agents stopped instead of resuming them\n  meet --on-done 'Comment a summary on the GitHub issue this came from with gh.'\n                                one more instruction for each agent when it is about to finish\n  meet record --duration 5      run the engine directly (flags pass through to meet-rec)\n  meet list                     print this repo's action items and their pull requests\n  meet sessions                 print this repo's sessions"
+transcript to a fast, low-effort headless Claude that looks up what this repository says about what is \
+being discussed — the facts land in the Related pane next to the transcript. Press x to stop the \
+recording: the whole transcript then goes to Claude once, which writes the meeting's summary and its \
+action items — each one a fully specified prompt. Select an item and press Enter: meet creates a git \
+worktree on a new branch, runs a Claude Code agent in it, commits, pushes, and opens a pull request \
+with `gh`. State lives in a SQLite database per user: every session's transcript, summaries, facts and \
+action items are kept (S lists them), and an agent that was running when meet quit is resumed on the \
+next launch in the same repo.",
+    after_help = "Examples:\n  meet                          record in the current repo\n  meet ~/code/app --no-system   microphone only, in another checkout\n  meet --replay meetings/2026-09-04_10-00/transcript.json --replay-speed 8\n                                replay a saved transcript instead of recording\n  meet --no-resume              leave interrupted agents stopped instead of resuming them\n  meet --on-done 'Comment a summary on the GitHub issue this came from with gh.'\n                                one more instruction for each agent when it is about to finish\n  meet record --duration 5      run the engine directly (flags pass through to meet-rec)\n  meet list                     print this repo's action items and their pull requests\n  meet sessions                 print this repo's sessions\n  meet ask                      in another terminal: a Claude Code session to ask about the meeting being recorded here"
 )]
 struct Cli {
     /// Directory inside the git repository to work on (default: the current directory).
@@ -85,7 +93,23 @@ struct Cli {
     #[arg(long, value_name = "DIR")]
     out_dir: Option<String>,
 
-    /// Model for the summarizer / action-item writer (a claude alias or id).
+    /// Model for the live lookup that fills the Related pane (a claude alias or id).
+    #[arg(long, default_value = "sonnet", value_name = "MODEL")]
+    lookup_model: String,
+
+    /// Effort for the live lookup (claude's --effort): low keeps it fast.
+    #[arg(long, default_value = "low", value_name = "LEVEL")]
+    lookup_effort: String,
+
+    /// Spending cap per lookup call.
+    #[arg(long, default_value_t = 0.5, value_name = "USD")]
+    lookup_budget: f64,
+
+    /// No live lookups; the action items are still written when the recording stops.
+    #[arg(long)]
+    no_lookup: bool,
+
+    /// Model for the action-item writer that runs when the recording stops.
     #[arg(long, default_value = "sonnet", value_name = "MODEL")]
     suggest_model: String,
 
@@ -93,11 +117,19 @@ struct Cli {
     #[arg(long, value_name = "MODEL")]
     agent_model: Option<String>,
 
-    /// Spending cap per summarizer call.
-    #[arg(long, default_value_t = 1.0, value_name = "USD")]
+    /// Spending cap for the action-item call.
+    #[arg(long, default_value_t = 2.0, value_name = "USD")]
     suggest_budget: f64,
 
-    /// Only transcribe; never call the summarizer.
+    /// Model for the question session (`a`, `meet ask`).
+    #[arg(long, default_value = "sonnet", value_name = "MODEL")]
+    ask_model: String,
+
+    /// Effort for the question session (default: claude's own).
+    #[arg(long, default_value = "default", value_name = "LEVEL")]
+    ask_effort: String,
+
+    /// Only transcribe; no lookups and no action items.
     #[arg(long)]
     no_suggest: bool,
 
@@ -165,6 +197,22 @@ enum Command {
         /// Directory inside the git repository (default: the current directory).
         dir: Option<PathBuf>,
     },
+    /// Open a Claude Code session to ask questions about a meeting: the one being recorded
+    /// in this repo right now, else the newest one. Run it in another terminal while `meet`
+    /// records (`a` in the TUI does it for you where it can).
+    Ask {
+        /// Directory inside the git repository (default: the current directory).
+        dir: Option<PathBuf>,
+        /// A session id from `meet sessions` (default: the live meeting, else the newest).
+        #[arg(long, value_name = "ID")]
+        meeting: Option<String>,
+        /// Model for the session (default: --ask-model).
+        #[arg(long, value_name = "MODEL")]
+        model: Option<String>,
+        /// Effort for the session (default: --ask-effort).
+        #[arg(long, value_name = "LEVEL")]
+        effort: Option<String>,
+    },
     /// Claude Code hook entry points (installed by meet for its own agents).
     #[command(hide = true)]
     Hook {
@@ -190,6 +238,20 @@ fn main() -> Result<()> {
         Some(Command::Sessions { dir }) => {
             runtime()?.block_on(sessions(dir.or(cli.dir).unwrap_or_else(|| ".".into())))
         }
+        Some(Command::Ask {
+            dir,
+            meeting,
+            model,
+            effort,
+        }) => ask::run_cli(
+            dir.or(cli.dir).unwrap_or_else(|| ".".into()),
+            meeting,
+            cli.claude_bin,
+            model.or(Some(cli.ask_model)).filter(|m| !m.trim().is_empty() && m != "default"),
+            effort
+                .or(Some(cli.ask_effort))
+                .filter(|e| !e.trim().is_empty() && e != "default"),
+        ),
         Some(Command::Hook {
             which: HookCommand::Stop,
         }) => hook::run_stop_hook(),
@@ -237,10 +299,19 @@ fn main() -> Result<()> {
                 config: cli.config,
                 claude_bin: cli.claude_bin,
                 gh_bin: cli.gh_bin,
+                lookup_model: Some(cli.lookup_model)
+                    .filter(|m| !m.trim().is_empty() && m != "default"),
+                lookup_effort: Some(cli.lookup_effort)
+                    .filter(|e| !e.trim().is_empty() && e != "default"),
+                lookup_budget_usd: cli.lookup_budget,
+                no_lookup: cli.no_lookup,
                 suggest_model: Some(cli.suggest_model)
                     .filter(|m| !m.trim().is_empty() && m != "default"),
                 agent_model: cli.agent_model,
                 suggest_budget_usd: cli.suggest_budget,
+                ask_model: Some(cli.ask_model).filter(|m| !m.trim().is_empty() && m != "default"),
+                ask_effort: Some(cli.ask_effort)
+                    .filter(|e| !e.trim().is_empty() && e != "default"),
                 no_suggest: cli.no_suggest,
                 no_resume: cli.no_resume,
                 on_done,
@@ -336,6 +407,7 @@ async fn sessions(dir: PathBuf) -> Result<()> {
     let items = store.list_items(&repo_key)?;
     for m in &meetings {
         println!("{}", ui::session_row(m, false, &items, 160));
+        println!("    id {}", m.id);
         if let Some(d) = &m.meeting_dir {
             println!("    {d}");
         }
