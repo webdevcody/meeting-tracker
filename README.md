@@ -4,19 +4,26 @@
 — alone at your desk, or on a call. It records the **microphone** and/or **all system
 audio** (Zoom, Meet, Teams, anything playing), transcribes **on-device** with Apple's
 `SpeechAnalyzer`, and every minute or so hands the newest stretch of transcript to a fast,
-low-effort headless Claude that looks up what *this* repository says about what is being
-discussed — which file does that, what the flag is called, how it behaves today. Those
-**facts** land in the Related pane next to the transcript while the conversation goes on.
-Press **`a`** (or run `meet ask` in another terminal) for a **Claude Code session that answers
-questions over the transcript as it grows** — "what did they decide about the deploy?",
-"which files came up?". Press **`x`** to stop the recording: the whole transcript goes to Claude once, which writes
-the meeting's **summary** and its **action items**: concrete changes to this repository that
+low-effort headless Claude that looks up what is already known about what is being
+discussed — in *this* repository (which file does that, what the flag is called, how it
+behaves today) and in the earlier meetings held in it (what was decided). The Related pane
+next to the transcript shows it per summary while the conversation goes on: the **context**,
+the **contradictions** between what was said and what the code or an earlier meeting shows,
+and the **questions** worth asking before moving on.
+Press **`a`** and a **Claude Code session opens in the right pane, inside `meet`**, that answers
+questions over the transcript as it grows — "what did they decide about the deploy?", "which
+files came up?" — while the transcript keeps scrolling beside it. Nothing records until you
+press **`r`**; press **`x`** to stop the recording: the whole transcript goes to Claude
+once, which writes the meeting's **summary** and its **action items**: concrete changes to this repository that
 you asked for or decided on, each written up as a fully specified prompt. Select one and
 press **Enter**: `meet` creates a git worktree on a new branch, runs a **Claude Code agent**
 in it, commits, pushes, and opens a **pull request** with `gh`.
 
-Every session is kept — every transcript line, the summaries, the facts, the action items —
-and can be read back later from the same TUI (`S`). An agent that was still running when
+Every session is kept — every transcript line, the summaries and what was looked up for them, the action items —
+and sits in the **session bar** under the header, newest at the left: `Tab` onto it, `←`/`→`
+(or `h`/`l`) walk it, and `a` on any past session opens a Claude Code session to ask about
+that meeting. Every recording is its own session — `r` after one ended starts the next; a
+session closed again without a word said is not kept. An agent that was still running when
 you quit resumes on the next launch in that repo; `X` stops one, and Enter resumes it where
 it was. An optional *on-done* instruction ("comment a summary on the GitHub issue") reaches
 each agent through a Claude Code Stop hook just before it finishes.
@@ -25,27 +32,75 @@ While recording — the transcript, and what the repo says about it:
 
 ```
  meet my-app (main)                                              ● REC 00:12:34  mic 41 · system 8
-╭ Transcript ─────────────────────────╮╭ Related · 5 · looking up #3 ────────────────────────╮
-│00:06 mic    the list command just   ││00:00 `todo.sh list` prints plain text through the   │
-│             prints plain text, I    ││      awk on line 18; there is no --json flag.       │
-│             want a --json flag …    ││      todo.sh:18                                     │
-│00:24 mic    adding a todo with      ││      `todo.sh add` takes only $1, so "buy milk"     │
-│             spaces is broken …      ││      becomes "buy".                                 │
-╰─────────────────────────────────────╯│      todo.sh:9                                      │
-╭ Summary · 31 words pending ─────────╮│01:05 The README documents add and list; `done` is   │
-│[1] 00:00–01:05 Wants a --json flag  ││      not mentioned.                                 │
-│    on list and is annoyed that add  ││      README.md                                      │
-│    drops everything after the first ││                                                     │
+ sessions  ● live │ 09-04 10:00 │ 09-02 15:20 │ 08-29 09:10
+╭ Transcript ─────────────────────────╮╭ Related · [1] 00:00–01:05 · looking up #2 ──────────╮
+│00:06 mic    the list command just   ││Wants a --json flag on list and is annoyed that add  │
+│             prints plain text, I    ││drops everything after the first word.               │
+│             want a --json flag …    ││                                                     │
+│00:24 mic    adding a todo with      ││Context                                              │
+│             spaces is broken …      ││• `todo.sh list` prints plain text through the awk   │
+╰─────────────────────────────────────╯│  on line 18; there is no --json flag.               │
+╭ Summary · 31 words pending ─────────╮│  todo.sh:18                                         │
+│▸[1] 00:00–01:05 Wants a --json flag ││• Decided in the meeting of 2026-09-04: output       │
+│    on list and is annoyed that add  ││  flags go on the subcommand, not on todo.sh itself. │
+│    drops everything after the first ││  meeting 2026-09-04                                 │
 │    word.                            ││                                                     │
-│[2] 01:05–02:10 looking up…          ││                                                     │
-╰─────────────────────────────────────╯╰─────────────────────────────────────────────────────╯
- x stop recording  Tab related/items  Enter run  X stop agent  d dismiss  i note  s look up now  space pause  ? help  q quit
+│ [2] 01:05–02:10 looking up…         ││Contradictions                                       │
+│                                     ││⚠ Said add "keeps everything after the first word";  │
+│                                     ││  `todo.sh add` takes only $1.                       │
+│                                     ││  todo.sh:9                                          │
+│                                     ││                                                     │
+│                                     ││Questions                                            │
+│                                     ││? One JSON object per line, or a single array?       │
+╰─────────────────────────────────────╯╰──────────────── Related │ Items │ Summary │ Claude ─╯
+ x stop recording  D discard  a ask Claude  Tab pane  ↑/↓ summary  Enter run  X stop agent  d dismiss  i note  s look up now  space pause  , settings  ? help  q quit
 ```
 
-After `x` — the action items, ready to run:
+After `x` — the Summary pane takes the right side and shows what is working on the
+meeting that just ended (the engine's `onDone` hooks — the bundled one has Claude write a
+summary file — and `meet`'s own Claude call), then the write-up as soon as it lands:
+
+```
+ meet my-app (main)                                                ✎ SUMMARIZING 00:14:02  mic 47 · system 9
+ sessions  ■ ended │ 09-04 10:00 │ 09-02 15:20 │ 08-29 09:10
+╭ Transcript ─────────────────────────╮╭ Meeting summary · hook running · writing… ──────────╮
+│00:06 mic    the list command just   ││✎ meet's summary and action items: Claude is reading │
+│             prints plain text, I    ││the whole transcript…                                │
+│             want a --json flag …    ││⚙ hook 1/1 summarize-transcript.sh: running… 23 s    │
+│00:24 mic    adding a todo with      ││    summarize-transcript: summarizing …/transcript.md│
+│             spaces is broken …      ││                                                     │
+╰─────────────────────────────────────╯│the write-up lands here the moment Claude answers…   │
+╭ Summary ────────────────────────────╮│                                                     │
+│[1] 00:00–01:05 Wants a --json flag  ││                                                     │
+╰─────────────────────────────────────╯╰──────────────── Related │ Items │ Summary │ Claude ─╯
+ hook 1/1 summarize-transcript.sh is running — m shows its output        ⚙ hook summarize-transcript.sh 23s  ✎ writing the summary
+```
 
 ```
  meet my-app (main)                                                     ■ ended 00:14:02  mic 47 · system 9
+ sessions  ■ ended │ 09-04 10:00 │ 09-02 15:20 │ 08-29 09:10
+╭ Transcript ─────────────────────────╮╭ Meeting summary ────────────────────────────────────╮
+│00:06 mic    the list command just   ││✓ meet's summary and action items: written           │
+│             prints plain text, I    ││✓ hook 1/1 summarize-transcript.sh: done in 41 s     │
+│             want a --json flag …    ││    wrote ~/Meetings/summaries/2026-09-11_json-flag.md│
+│00:24 mic    adding a todo with      ││                                                     │
+│             spaces is broken …      ││Summary                                              │
+╰─────────────────────────────────────╯│A short working session on todo.sh: a --json flag    │
+╭ Summary ────────────────────────────╮│for list, and a bug in add that drops words.         │
+│[1] 00:00–01:05 Wants a --json flag  ││                                                     │
+│    on list and is annoyed that add  ││Decisions                                            │
+│    drops everything after the first ││• output flags go on the subcommand                  │
+│    word.                            ││                                                     │
+│[2] 01:05–02:10 Decided the README   ││── 2026-09-11_json-flag.md · written by summarize-t… │
+╰─────────────────────────────────────╯╰──────────────── Related │ Items │ Summary │ Claude ─╯
+ summary written · 3 action items — Tab shows the board, m the summary            in 62k · out 4.1k · $0.38
+```
+
+`Tab` (or `m` back again) — the action items, ready to run:
+
+```
+ meet my-app (main)                                                     ■ ended 00:14:02  mic 47 · system 9
+ sessions  ■ ended │ 09-04 10:00 │ 09-02 15:20 │ 08-29 09:10
 ╭ Transcript ─────────────────────────╮╭ Action items · 3 · 1 running ──────────────────────╮
 │00:06 mic    the list command just   ││○ Add --json flag to `todo.sh list`                  │
 │             prints plain text, I    ││● Fix `todo add` to keep text after first word   ● Ba…│
@@ -59,8 +114,8 @@ After `x` — the action items, ready to run:
 │    drops everything after the first ││In todo.sh, the `list` command prints plain text via │
 │    word.                            ││the awk on line 18. Add a `--json` flag so that      │
 │[2] 01:05–02:10 Decided the README   ││`./todo.sh list --json` prints one JSON object per   │
-╰─────────────────────────────────────╯╰─────────────────────────────────────────────────────╯
- Tab related/items  Enter run  X stop agent  d dismiss  l log  o open PR  S sessions  ←/→ session  ? help  q quit
+╰─────────────────────────────────────╯╰──────────────── Related │ Items │ Summary │ Claude ─╯
+ a ask Claude  Tab pane  ↑/↓ item  Enter run  X stop agent  d dismiss  l log  o open PR  S sessions  ←/→ session  , settings  ? help  q quit
 ```
 
 Two binaries, one tool: `meet` (Rust, the TUI; `crates/meet`) and `meet-rec` (Swift, the
@@ -76,6 +131,13 @@ make install          # builds both binaries, symlinks ~/.local/bin/meet and ~/.
 meet --help
 ```
 
+Working from the checkout, `make dev` builds the latest code and launches it in an isolated
+instance: its own data directory under `~/.meet-dev/`, seeded from your real sessions the first
+time, so nothing you try lands in the real database. `make cycle` runs `make install` first, so
+the `meet` on your `PATH` is the new build too. A `meet` that is already running keeps the code
+it started with: quit it (`q`) and start it again. `make help` lists the rest (`make e2e`,
+`make test`, `make dev-reset`).
+
 ## Use it
 
 ```sh
@@ -87,14 +149,57 @@ meet --no-mic         # system audio only (a call you are listening to)
 
 Then talk. The transcript scrolls on the left. When a chunk of talk closes — after a
 pause, or ~180 words, or 90 s — a one-line summary appears under it, and the **Related**
-pane on the right fills with what the repository says about what was just said: short
-facts, each with the file (and line) that shows it, found by a fast `sonnet --effort low`
-call with read-only tools. `Tab` flips the right pane to the action-item board and back.
+pane on the right shows what is already known about it, found by a fast `sonnet --effort
+low` call with read-only tools over the repository, and over the earlier meetings held in
+it (their summaries, what they looked up, the board): **Context** — short facts, each with
+the file and line (or the meeting) that shows it; **Contradictions** — where what was said
+does not match the code or an earlier decision; **Questions** — worth asking before moving
+on. The pane follows the newest summary as they land; `↑`/`↓` pick an earlier one (it is
+marked `▸` on the left), `G` follows again. `Tab` flips the right pane to the action-item
+board and back.
 
-Press **`x`** when you are done talking (it asks first — there is no starting the
-recording again). The transcript and audio are saved, the engine's hooks run, and the
-whole transcript goes to Claude once: it writes the meeting's summary and its **action
-items**, which land at the top of the board, newest first. Each item carries:
+The bottom right of the footer keeps a running total of what all of this spends —
+`in 45k · out 3.4k · $0.31`: the tokens every Claude call read (fresh and from the prompt
+cache) and wrote, and the dollars `claude` reported, across the lookups, the action-item
+writer and each agent. A running agent counts turn by turn as it works; its output tokens
+and its price land when it finishes. The question session (`a`) is interactive and is not
+counted.
+
+Press **`x`** when you are done talking (it asks first). The transcript and audio are
+saved, and two things start at once, both visible: the header switches to `✎ SUMMARIZING`
+and the right pane becomes the **Meeting
+summary** pane, which lists what is at work and how far along it is.
+
+- The engine runs its **`onDone` hooks** (`meet.json` → `hooks.onDone`), one after another.
+  The bundled `hooks/summarize-transcript.sh` runs Claude on the transcript and writes a
+  Markdown summary file; a hook of your own — a repo-specific skill, say — runs the same
+  way. Each hook shows as it starts (`⚙ hook 1/1 summarize-transcript.sh: running… 23 s`,
+  with the last lines it printed under it), the footer counts its seconds, and a flash says
+  when it ended and how (`hook summarize-transcript.sh wrote …/2026-09-11_json-flag.md in
+  41 s`; a non-zero exit is a warning). When a hook's last lines name a Markdown or text
+  file it wrote, that file is shown at the bottom of the pane, so a summary a hook writes
+  is readable in `meet` too.
+- `meet`'s own Claude call reads the whole transcript once and answers with the meeting's
+  **summary** (a few sentences — the session's one-line description), its **write-up**
+  (Markdown: summary, key points, decisions, open questions, action items) and its **action
+  items**. The write-up lands in the pane the moment it is back; the items land at the top
+  of the board, newest first (`Tab` shows it; `m` returns to the summary). It is meet's own
+  summary, independent of whatever the hooks write, and it is kept with the session: `m` on
+  a past session reads it back.
+
+Press **`D`** instead to throw the recording away — a false start, a call that turned out
+to be nothing. It asks first; then the recording stops and nothing is kept: the engine
+deletes the meeting directory (audio and transcript) and runs no `onDone` hook, `meet`
+writes no summary or action items, drops the session from the session bar along with its
+live files, and quits. `q` while recording offers the same under `d`.
+
+Press **`r`** for the next meeting: the ended session slides along the session bar and a
+new one opens — the transcript, the summaries, the clock and the Related pane start over,
+while the board, the Claude Code sessions and any running agents stay. A summary call or a
+hook still working on the ended meeting finishes in the background and lands on it.
+
+Quitting while either is still running asks first — the engine, and any hook it is running,
+goes down with `meet`. Each action item carries:
 
 - a **title** you can read at a glance (`Add --json flag to `todo.sh list``),
 - the **prompt** the agent will get: one complete request in your own words with the real
@@ -127,39 +232,68 @@ already done and only the push or the pull request failed, redoes just that tail
 
 | key | |
 |---|---|
-| `x` | stop the recording and stay: the transcript and audio are saved, the engine's hooks run, and the action items are written from everything that was said |
-| `Tab` | flip the right pane: related facts / action items (the board takes over on its own when the items land) |
-| `j` / `k`, `↓` / `↑` | select an action item |
+| `r` | start recording — nothing records until you do; after a recording ended, start the next one as a new session on the bar |
+| `x` | stop the recording and stay: the transcript and audio are saved, the engine's hooks run, and the summary, the write-up and the action items are written from everything that was said — the Summary pane shows all of it as it happens |
+| `D` | discard the recording and quit (asks first): it stops, the engine deletes its audio and transcript and runs no hook, nothing is summarized, and the session is dropped as if it never happened |
+| `m` | the Meeting summary pane: while the meeting is being summarized, the hooks and meet's summary call at work; then the write-up, and the file a hook wrote. On a past session, its write-up |
+| `Tab` | cycle the focus: related context / action items / meeting summary / the Claude Code session once one is open / the session bar (`Shift+Tab` goes backwards; the summary takes over on its own when the recording stops) |
+| `j` / `k`, `↓` / `↑` | pick a summary — the Related pane shows its context, contradictions and questions — or, on the board, an action item; on the Summary pane, scroll |
 | `Enter` | run it — worktree, agent, pull request — or resume it where it stopped |
 | `X` | stop its agent (SIGTERM, then SIGKILL after 4 s); the worktree, commits and session stay |
 | `d` | dismiss it (gone for good) |
 | `l` | the agent's log, live while it runs |
 | `o` | open its pull request |
-| `a` | ask questions: a Claude Code session over the live transcript — beside `meet` in nebula or tmux when it can, else it names the `meet ask` command to run in another terminal |
+| `a` | ask Claude Code about the session on screen — the live meeting, or the past session the bar is on: a session starts in the right pane (an embedded terminal) and takes the keys; `Ctrl+q` hands them back to `meet`, `a` again returns them. Each session keeps its own |
 | `i` | type a note into the transcript (no mic needed) |
-| `s` | look up what is pending right now; once the recording has ended, write the action items again |
+| `s` | look up what is pending right now; once the recording has ended, write the summary and the action items again |
 | `space` | pause / resume the recording (paused time is excluded from the files) |
-| `PgUp` / `PgDn`, `J` / `K` | scroll the transcript; `G` follows the newest line again |
-| `[` / `]` | scroll the right pane (the facts, or the prompt) |
-| `S` | the session list: every meeting held in this repo, newest first |
-| `←` / `→` | step to an older / newer session; `Esc` returns to the live meeting |
+| `M` / `N` | mute / unmute the microphone / the system audio: while muted, that source is recorded and transcribed as silence (the other keeps going, the files stay in sync) and the header marks it `⊘ mic`; clicking `mic` / `system` in the header does the same |
+| `PgUp` / `PgDn`, `J` / `K` | scroll the transcript; `G` follows the newest line and the newest summary again |
+| `[` / `]` | scroll the right pane (the related context, the prompt, or the summary) |
+| `←` / `→` | walk the session bar: `→` an older session, `←` a newer one (the live meeting is at the left end); `Esc` returns to the live meeting |
+| `h` / `l` | the same while the bar has the keys (`Tab` onto it); `Enter` or `Esc` hand them back to the panes |
+| `S` | the session list: every meeting held in this repo, newest first, with details |
+| `,` | [settings](#settings): which Claude model and effort the lookup, the action items, the agent and the question session run with — a change is saved and live at once |
 | `?` | keys |
-| `q`, `Ctrl+C` | quit. While recording it asks: `y` stops the recording, saves and quits *without* writing action items; `x` stops the recording and stays instead. Running agents are stopped and resume on the next launch |
+| `q`, `Ctrl+C` | quit. While recording it asks: `y` stops the recording, saves and quits *without* writing action items; `x` stops the recording and stays instead; `d` discards the recording (as `D`). Running agents are stopped and resume on the next launch |
+
+### Mouse
+
+What the keys reach, the mouse reaches too, the way it does in nebula:
+
+- **Click** a pane to give it the keys — the Claude Code pane hands them to Claude, as `a`
+  does. A tab on the right pane's border (`Related │ Items │ Summary │ Claude`) shows that
+  pane; a session on the session bar shows that session; a summary picks it for the Related
+  pane; an action item selects it; `mic` / `system` in the header mutes that source. In an
+  overlay, a row of the session list opens it and a row of the settings picks it (a second
+  click cycles it); a click outside the overlay closes it, as `Esc` would.
+- **Scroll** with the wheel over the transcript, the right pane or the agent log; over the
+  summaries, the action items, the session list or the settings it steps the selection.
+- **Drag** the border between two panes to resize them: the seam between the columns, the
+  one between the transcript and the summaries, the one between the action items and the
+  prompt. Each carries a short thick grip in its middle, and the pointer turns into resize
+  arrows over it in terminals that support that. The shares are kept in `layout.json` in
+  the data directory, so the next launch opens the same way (delete the file for the
+  defaults). Hold `⇧` (`⌥` in some terminals) to select text through your terminal instead.
 
 ### What is kept where
 
 - **Transcript and audio** go where the engine puts them: `meet.json` → `outputDir`, else
   `~/Meetings/<date>_<time>/` (`audio.m4a`, `transcript.md`, `transcript.json`,
   `meta.json`). The engine's `onDone` hooks (the bundled summary hook) still run when the
-  meeting ends.
+  meeting ends, and write wherever they write (the bundled one: `summary.dir`, else
+  `<outputDir>/summaries/`); `meet` shows their progress and, when they name the file
+  they wrote, the file.
 - **Sessions** live in a SQLite database per user,
   `~/Library/Application Support/dev.meet.meet/meet.db` (override with `MEET_DATA_DIR`),
-  keyed by repository path: one row per `meet` launch with the summary written when it
-  ended, every transcript line as it was heard or typed, the chunks with their summaries
+  keyed by repository path: one row per `meet` launch with the summary and the write-up
+  written when it ended, every transcript line as it was heard or typed, the chunks with their summaries
   and the facts looked up for them, and the action items with their branch, worktree,
   Claude session id, pull request and log. Run `meet` again in the same repo and
-  the items from earlier sessions are still on the board; `S` opens any earlier session.
-  `meet list` prints the items, `meet sessions` the sessions.
+  the items from earlier sessions are still on the board, and every earlier session is a
+  tab in the session bar (`S` lists them with details). A launch closed again without a
+  word said leaves no session behind. `meet list` prints the items, `meet sessions` the
+  sessions.
 - **Agent runs** keep their prompt, a readable log, the raw stream, the PR text and (when
   configured) the on-done prompt and its hook settings under `…/dev.meet.meet/runs/<item-id>/`.
 - **Live files** for the question session go under `…/dev.meet.meet/sessions/<session-id>/`:
@@ -177,16 +311,20 @@ project.
 meet [DIR]                       the checkout to work in (default: .)
   --no-mic | --no-system | --aec | --fast | --no-hooks | --config F | --out-dir D
                                  passed through to the engine
-  --lookup-model MODEL           the live lookup that fills the Related pane (default: sonnet)
-  --lookup-effort LEVEL          its --effort (default: low)
+  --lookup-model M --lookup-effort L
+                                 the live lookup that fills the Related pane, this launch only
+                                 (default: the settings — , in the TUI — else sonnet at low effort)
   --lookup-budget USD            cap per lookup call (default: 0.50)
   --no-lookup                    no live lookups; the action items are still written at the end
-  --suggest-model MODEL          the action-item writer that runs when the recording stops (default: sonnet)
+  --suggest-model M --suggest-effort L
+                                 the action-item writer that runs when the recording stops
+                                 (default: the settings, else sonnet)
   --suggest-budget USD           cap for that one call (default: 2.00)
-  --agent-model MODEL            the implementing agent (default: claude's default)
+  --agent-model M --agent-effort L
+                                 the implementing agent (default: the settings, else meet.json
+                                 agent.model, else claude's own)
   --no-suggest                   transcribe only: no lookups, no action items
-  --ask-model MODEL              the question session (a, meet ask) (default: sonnet)
-  --ask-effort LEVEL             its --effort (default: claude's own)
+  --ask-model M --ask-effort L   the question session (a, meet ask) (default: the settings, else sonnet)
   --no-resume                    leave agents that were running when meet last quit stopped
   --on-done TEXT | --on-done-file FILE
                                  one more instruction for every agent as it finishes (config: agent.onDone)
@@ -200,8 +338,8 @@ meet init …                      write a meet.json (see Config)
 meet list [DIR]                  this repo's action items and pull requests
 meet sessions [DIR]              this repo's sessions (with their ids)
 meet ask [DIR] [--meeting ID] [--model M] [--effort E]
-                                 a Claude Code session to ask about the meeting being recorded
-                                 here (else the newest one) — run it in another terminal
+                                 the question session in this terminal instead of meet's pane:
+                                 the meeting being recorded here, else the newest one
 ```
 
 Try it without a microphone:
@@ -210,45 +348,80 @@ Try it without a microphone:
 meet --replay crates/meet/testdata/demo-transcript.json --replay-speed 8 .
 ```
 
+### Settings
+
+`,` opens the settings: which Claude model and `--effort` each of the four features runs
+with — the live lookup, the action-item writer, the implementing agent and the question
+session. It is laid out like nebula's: a row per value, `↑`/`↓` to move, `←`/`→` (or
+`Enter`) to step through the choices, `1`–`4` to jump to a feature, `R` to put everything
+back to its default, `Esc` to close. The choices are claude's aliases (`haiku`, `sonnet`,
+`opus`, `fable`) and the current model ids, and the effort levels `low` to `max`;
+`default` passes no flag, so claude picks. A change is written to
+`~/Library/Application Support/dev.meet.meet/settings.json` the moment it is made and is
+live at once: the next lookup, the next action-item run, agents started from then on, the
+next question session (running agents keep the model they started with). Hand-edit the
+file if you like; a model that is not in the list is kept and passed through as it is.
+
+The defaults are what `meet` always ran with: the lookup on `sonnet` at `low` effort, the
+action items and the question session on `sonnet`, the agent on claude's own model (or
+`agent.model` from `meet.json`). A `--lookup-model`, `--agent-effort`, … flag overrides the
+setting for one launch; the modal says so beside the row.
+
 ### Asking questions while it records
 
-Press **`a`** while the meeting goes on (or after it ended) and `meet` opens an interactive
-Claude Code session in this repository whose job is to answer questions about the meeting:
-what was said about X, what was decided, when something came up, how it relates to the code.
-It is a normal `claude` run — you type questions, it answers — given a system prompt that
-names the live files above and one rule that matters: **re-read `transcript.md` from the top
-before every answer**, because it has grown since the last look. It may read the repository
-(Glob, Grep, Read) but is told not to edit, build, or commit. Its first turn reads both files
-and reports how long the meeting has run and what it has been about. The same session is
-`meet ask`, typed into any terminal: it picks the meeting being recorded in this repo (else
-the newest one; `--meeting <id>` from `meet sessions` picks another, and a meeting recorded
-before these files existed gets them written from the database first) and replaces itself with
-`claude --append-system-prompt-file … --add-dir … --name "meet · questions"`.
+Press **`a`** while the meeting goes on (or after it ended) and Claude Code starts in the right
+pane, on a terminal embedded in `meet` — the transcript keeps scrolling on the left. It is a
+normal interactive `claude` run in this repository whose job is to answer questions about the
+meeting: what was said about X, what was decided, when something came up, how it relates to
+the code. Its system prompt names the live files above and carries one rule that matters:
+**re-read `transcript.md` from the top before every answer**, because it has grown since the
+last look. It may read the repository (Glob, Grep, Read) but is told not to edit, build, or
+commit. Its first turn reads both files and reports how long the meeting has run and what it
+has been about.
 
-Where `a` puts the session depends on where `meet` is running:
+While the pane has the keys, every key goes to Claude Code — type a question, Enter sends
+it, Esc interrupts it, Ctrl+C is its own. **`Ctrl+q`** (or `Ctrl+]`) hands the keys back to
+`meet`; the session keeps running and painting, `Tab` cycles the focus through related
+facts, action items, the session and the session bar, and **`a`** gives it the keys again. If Claude Code
+exits (`/exit`, Ctrl+D), the pane keeps its last screen and the next `a` starts a fresh
+session. Quitting `meet` ends the session. Keys reach it in the conventional xterm
+encoding — no kitty keyboard protocol — so Shift+Enter is not a newline there; type `\` and
+Enter, as in any plain terminal. The pane is the right column, so give `meet` a wide
+terminal.
 
-- **inside a nebula agent session** (`NEBULA_AGENT_ID` is set): `nebula spawn` starts a Claude
-  session beside it, in the same worktree, with the whole context as its first prompt — nebula
-  takes no system prompt from outside. It shows up in nebula's session list on its own; pick
-  it there. nebula only accepts spawn requests from inside an agent session, so this path does
-  not fire from a plain nebula terminal; there, run `meet ask` in a second terminal session of
-  the same worktree — that is a Claude Code session inside nebula, beside `meet`.
-- **inside tmux** (`$TMUX` is set): a pane opens to the right of `meet` running `meet ask`.
-- **anywhere else**: the footer (and the log) show the exact `meet ask …` command to run in
-  another terminal.
+**`a` on a past session** — walk the session bar to it — asks about that meeting instead: its
+transcript and summary are written from the database first (the definitive record), the
+session is told the meeting has ended, and it answers from what was said then. Each
+session keeps its own Claude Code; the tab the bar is on decides which one the right pane
+shows, and all of them end when `meet` quits.
 
-One question session per launch; `a` again says where it is.
+The same session is `meet ask`, typed into any terminal: it picks the meeting being recorded
+in this repo (else the newest one; `--meeting <id>` from `meet sessions` picks another, and a
+meeting recorded before these files existed gets them written from the database first) and
+replaces itself with `claude --append-system-prompt-file … --add-dir … --name "meet ·
+questions"`. In nebula that is a second terminal session of the same worktree, beside `meet`
+(nebula takes no session requests from outside its own agent sessions, which is why `a` runs
+the terminal itself).
 
 ### Sessions, stopping and resuming
 
-Each launch of `meet` is a **session**. `S` lists every session held in this repo — when,
-how long, how many lines were said, how many action items came of it and what happened to
-them, and its summary as a one-line description. Enter on one puts that session on
-screen: its transcript and summaries on the left, and on the right only the action items
-it produced, still live — an agent started from last week's session and running now
-updates there as it works; `Tab` shows the facts that were looked up during it. `←` / `→`
-step to an older / newer session without the list; `Esc` returns to the live meeting. The
-live meeting's action items still land on the live board while you read.
+Each launch of `meet` is a **session**, and every session held in this repo is a tab in the
+**session bar** under the header: the live meeting at the left end, then every earlier one,
+newest first, each named by when it started. `→` steps to an older session and `←` to a
+newer one; `Tab` puts the keys on the bar itself (its tab is bracketed), where `h` / `l` do
+the same and `Enter` or `Esc` hand the keys back; `Esc` returns to the live meeting. When
+there are more tabs than fit, the bar scrolls to keep the shown one in view and counts
+what is hidden past each end. A past session on screen shows its transcript and summaries
+on the left and on the right only the action items it produced, still live — an agent
+started from last week's session and running now updates there as it works; `Tab` shows
+the facts that were looked up during it, and `a` opens a Claude Code session to ask about
+it. `S` lists the sessions with details — when, how long, how many lines were said, how
+many action items came of it and what happened to them, and the summary as a one-line
+description — and Enter on one opens it. The live meeting's action items still land on
+the live board while you read. Every recording is its own session: the launch opens one,
+`r` starts recording into it, and `r` after that recording ended closes it and opens the
+next; close `meet` without a word said and the open session is dropped again (as is any a
+crash left empty), so the bar holds only meetings that happened.
 
 **Stopping.** `X` on a running item stops its agent: a SIGTERM to the agent's process
 group (so the tools it was running go with it), then a SIGKILL if it is still there after
@@ -313,22 +486,32 @@ agent writes during the step is committed with the rest.
 Two calls while you talk and after, one agent per item:
 
 - **The lookup**, once per chunk while recording: `claude -p --output-format json
-  --json-schema … --effort low` (`--lookup-model`, `sonnet` by default) with read-only
+  --json-schema … --effort low` (its model and effort come from the [settings](#settings):
+  `sonnet` at `low` by default) with read-only
   tools (`Read`, `Glob`, `Grep`), a small spending cap, the summaries so far and the facts
   already shown so it never repeats one. It answers with the chunk's one-line summary and
   zero to four facts, each with the file that shows it. Calls run one at a time, in order.
 - **The suggester**, once when the recording stops (or the engine dies): the same shape
-  without `--effort`, given the whole transcript, the chunk summaries, the facts and the
-  board, so it never proposes what is already there. It answers with the meeting's summary
-  and zero to eight action items. `s` after the end runs it again.
+  with its own model and effort from the settings (`sonnet`, claude's own effort by
+  default), given the whole transcript, the chunk summaries, the facts and the
+  board, so it never proposes what is already there. It answers with the meeting's summary,
+  its write-up (`notes`: Markdown with summary, key points, decisions, open questions and
+  action items, what the Summary pane shows) and zero to eight action items. `s` after the
+  end runs it again.
+
+The engine's `onDone` hooks are not Claude calls `meet` makes: the engine runs them
+(`meet.json` → `hooks.onDone`) and reports each one starting and ending, and `meet` shows
+that. The bundled hook is itself one more `claude -p` — see [Config](#config).
 
 The question session (`a`, `meet ask`) is the one interactive call: `claude
 --append-system-prompt-file <session dir>/ask-system.md --add-dir <session dir> --name "meet ·
-questions"` (`--ask-model`, `sonnet` by default) in the repository, with a first prompt that
-reads the live files. Through nebula the same text goes in as the starting prompt instead.
+questions"` (its model and effort from the settings, `sonnet` by default) in the repository, with a first prompt that
+reads the live files. Under `a` it runs on a pseudo-terminal `meet` owns (portable-pty), its
+output parsed by a vt100 screen that the right pane paints.
 
 The agent that implements an item runs `claude -p --output-format stream-json
---dangerously-skip-permissions` inside the worktree; `meet` itself does the deterministic
+--dangerously-skip-permissions` inside the worktree, with the agent's model and effort from
+the settings (claude's own by default); `meet` itself does the deterministic
 tail (commit, push, `gh pr create`) so a run always ends in a pull request or a clear
 error. Both drop `CLAUDECODE` from the environment, so `meet` also works when launched from
 inside a Claude Code session.
@@ -338,8 +521,11 @@ inside a Claude Code session.
 `meet-rec` is the recorder the TUI drives (`meet record …` is the same thing). It captures
 the microphone and/or system audio, transcribes each source on-device with Apple's
 `SpeechAnalyzer` while recording, merges everything into one audio file and one transcript,
-and runs your shell hooks. With `--json` it streams events (segments, status, lifecycle)
-as newline-delimited JSON on stdout, which is how the TUI reads it.
+and runs your shell hooks. With `--json` it streams events (segments, status, lifecycle,
+and after `finished` a `hooks` event with how many `onDone` hooks follow, then a `hook`
+pair — `phase` `start` / `end`, with the command, the exit `status` and the `secs` it took
+— around each one) as newline-delimited JSON on stdout, which is how the TUI reads it;
+what a hook prints goes to stderr.
 
 ```sh
 meet record                 # mic + system audio, plain terminal recorder
@@ -357,10 +543,15 @@ While recording directly, the terminal shows a status line and prints each final
 sentence labeled by the source it came from:
 
 ```
-● REC 00:12:34 │ mic 12 · system 8 │ 84 MB │ [space] pause  [q] stop
+● REC 00:12:34 │ mic 12 · system 8 │ 84 MB │ [space] pause  [m] mute mic  [n] mute system  [q] stop  [D] discard
 ```
 
-Keys: `space` pause/resume, `q` / `enter` / `ctrl-c` stop. `SIGTERM` and `SIGHUP` also stop
+Keys: `space` pause/resume, `m` / `n` mute/unmute the microphone / the system audio (a
+muted source is recorded and transcribed as silence, so the tracks stay in sync; the
+status line marks it `⊘ mic`; in `--json` mode each flip is a `muted` event), `q` /
+`enter` / `ctrl-c` stop, `D` discard (the meeting
+directory is deleted — no audio, no transcript — and no hook runs; in `--json` mode a
+`discarded` event replaces `finished`). `SIGTERM` and `SIGHUP` also stop
 cleanly: audio files are finalized, the transcript is written and hooks run.
 
 ### Per-project config
@@ -491,7 +682,7 @@ All keys are optional; see `config.example.json`:
 | `summary.claudePath` | — | the `claude` binary if it's not in `PATH`. |
 | `hooks.onDone` | `--no-hooks` to skip | shell commands run after the transcript is written. |
 | `hooks.env` | — | extra env vars for every hook. Applied last, so they can override any `MT_*` value. |
-| `agent.model` | `--agent-model` | the TUI's implementing agent (`claude --model …`). `"default"` or unset: Claude's own. |
+| `agent.model` | `--agent-model` | the TUI's implementing agent (`claude --model …`), used while the agent model in the [settings](#settings) is `default`. `"default"` or unset: Claude's own. |
 | `agent.onDone` / `agent.onDoneFile` | `--on-done` / `--on-done-file` | the [on-done step](#the-on-done-step): one more instruction for each agent as it finishes. A string, an array of lines, or a file. Empty: no such step. |
 
 Relative paths in the file (`promptFile`, `summary.dir`, …) resolve against the config
@@ -576,6 +767,7 @@ crates/meet/src/        the `meet` TUI (Rust)
   event_loop.rs        keys, recorder / suggester / runner events, the one-second tick
   app.rs               TUI state and its transitions
   ui.rs                header, transcript, summaries, action items, prompt pane, overlays
+  layout.rs            the seams between the panes (dragged with the mouse; layout.json) and where the last frame drew what, for the clicks
   recorder.rs          `meet-rec record --json` as a child process; transcript replay
   chunker.rs           when a stretch of transcript becomes a chunk to summarize
   suggest.rs           the summarizer / action-item writer (prompt-doctor rules) via `claude -p`
@@ -583,6 +775,7 @@ crates/meet/src/        the `meet` TUI (Rust)
   claude.rs            headless Claude: structured one-shots, streaming agents (resume, stop)
   hook.rs              the on-done step: the Stop hook settings and `meet hook stop`
   config.rs            the `agent` block of meet.json, with the engine's lookup order
+  settings.rs          which Claude model and effort each feature runs with; the settings file (`,`)
   stream_json.rs       `--output-format stream-json` parsing
   git.rs               git / gh, shelled out; nebula's worktree layout
   branch_name.rs       action-item title → branch slug

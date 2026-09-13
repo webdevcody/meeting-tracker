@@ -67,6 +67,9 @@ final class TrackTranscriber {
                                               start: result.range.start.seconds,
                                               end: result.range.end.seconds))
                 }
+            } catch is CancellationError {
+                // `cancel()` — a discard: the stream was ended on purpose, nothing to say.
+                throw CancellationError()
             } catch {
                 // Surface immediately: audio keeps recording, but this track's transcript stops.
                 log("⚠ \(source.label) transcriber stopped: \(error) — audio is still being recorded")

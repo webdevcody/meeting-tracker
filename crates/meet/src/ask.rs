@@ -1,13 +1,10 @@
-//! The question session: an interactive Claude Code terminal the user asks about the
+//! The question session: an interactive Claude Code session the user asks about the
 //! meeting while it goes on ("what did they say about the deploy?", "which files came up?")
 //! — and afterwards. It is an ordinary `claude` run in the repository, told where the live
 //! transcript and the running summary are (`live`) and to re-read them before every answer.
 //!
-//! `meet ask` runs one in whatever terminal it is typed in. `a` in the TUI opens one where
-//! it can: `nebula spawn` when `meet` itself runs inside a nebula agent session (nebula only
-//! takes spawn requests from there), a tmux pane beside `meet` when inside tmux, and
-//! otherwise it says what to run. Either way the context reaches Claude as text: a system
-//! prompt file when `meet` starts `claude` itself, the starting prompt through nebula.
+//! `a` in the TUI runs it inside `meet`, in the right column, on an embedded terminal
+//! (`term`); `meet ask` runs the same session in whatever terminal it is typed in.
 
 use crate::live::{self, LiveFiles, SUMMARY_FILE, TRANSCRIPT_FILE};
 use crate::store::{MeetingRow, Store};
@@ -49,35 +46,23 @@ impl AskContext {
     pub fn system_file(&self) -> PathBuf {
         self.session_dir.join(SYSTEM_FILE)
     }
+
+    /// Write the system prompt where `claude --append-system-prompt-file` reads it.
+    pub fn write_system_file(&self) -> Result<PathBuf> {
+        let path = self.system_file();
+        std::fs::write(&path, system_prompt(self))
+            .with_context(|| format!("write {}", path.display()))?;
+        Ok(path)
+    }
 }
 
 /// How to start it.
 #[derive(Debug, Clone)]
 pub struct Launch {
-    /// This binary — what the tmux pane and the printed command run (`meet ask`).
-    pub exe: PathBuf,
     pub claude_bin: String,
     pub model: Option<String>,
     pub effort: Option<String>,
     pub ctx: AskContext,
-}
-
-/// What the TUI hears back from `open`.
-#[derive(Debug, Clone, PartialEq)]
-pub enum AskEvent {
-    Opened(Opened),
-    Failed(String),
-}
-
-/// Where the session ended up.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Opened {
-    /// A new agent beside this one in nebula's session list.
-    Nebula,
-    /// A pane beside `meet`.
-    Tmux,
-    /// Nowhere yet: this is the command to run in another terminal.
-    Manual(String),
 }
 
 pub fn system_prompt(ctx: &AskContext) -> String {
@@ -92,12 +77,12 @@ pub fn system_prompt(ctx: &AskContext) -> String {
 
 The transcript is at {transcript}: one line per sentence as it was heard, `[mm:ss] source: text`, appended while the meeting goes on. Sources: "mic" is this Mac's microphone (the developer and anyone in the room), "system" is audio the Mac played (remote call participants, videos), "typed" is a note typed into meet. Expect recognition errors, filler words and half sentences; read through them.
 
-The running summary is at {summary}: the recording state and length, the meeting's summary once written, meet's one-line summaries per minute of talk, the facts about the repository it looked up along the way, and the action items on its board.
+The running summary is at {summary}: the recording state and length, the meeting's summary once written, meet's one-line summaries per minute of talk — under each, what it looked up in the repository and earlier meetings that bears on it, the contradictions it noticed (⚠) and the questions it suggested asking (?) — and the action items on its board.
 
 Rules:
 - Before answering ANY question, Read {transcript} again from the top — it has grown since you last looked; never answer from memory of an earlier read. Read {summary} when the question is about what meet concluded, the action items, or how long things have run.
 - When the question is about the code, use Glob, Grep and Read on the repository at {repo}. Do not edit files, run builds or tests, commit, or take any other action: this session is for answers. If asked to draft something (a message, a list, a summary), write it in your reply, not into a file, unless a file is asked for.
-- Answer in plain prose, briefly — under about 150 words unless asked for more. Quote the transcript line (with its [mm:ss]) that supports what you say, and say plainly when the transcript does not answer the question. Do not invent what was not said."#,
+- Answer in plain prose, briefly — under about 150 words unless asked for more; you are read in a narrow pane beside the transcript. Quote the transcript line (with its [mm:ss]) that supports what you say, and say plainly when the transcript does not answer the question. Do not invent what was not said."#,
         repo = ctx.repo.display(),
         transcript = ctx.transcript().display(),
         summary = ctx.summary().display(),
@@ -113,49 +98,8 @@ pub fn first_prompt(ctx: &AskContext) -> String {
     )
 }
 
-/// nebula takes no system prompt, only a first prompt: both in one.
-pub fn starting_prompt(ctx: &AskContext) -> String {
-    format!("{}\n\n{}", system_prompt(ctx), first_prompt(ctx))
-}
-
-/// The `meet ask …` argv (after the binary) that reopens this session anywhere.
-pub fn ask_args(l: &Launch) -> Vec<String> {
-    let mut args = Vec::new();
-    // A top-level flag: it goes before the subcommand.
-    if l.claude_bin != "claude" {
-        args.push("--claude-bin".into());
-        args.push(l.claude_bin.clone());
-    }
-    args.push("ask".into());
-    args.push("--meeting".into());
-    args.push(l.ctx.meeting_id.clone());
-    if let Some(m) = &l.model {
-        args.push("--model".into());
-        args.push(m.clone());
-    }
-    if let Some(e) = &l.effort {
-        args.push("--effort".into());
-        args.push(e.clone());
-    }
-    args.push(l.ctx.repo.to_string_lossy().into_owned());
-    args
-}
-
-/// `meet ask …` as one shell line. A `MEET_DATA_DIR` override travels with it: a tmux pane
-/// or another terminal does not inherit this process's environment.
-pub fn ask_command(l: &Launch) -> String {
-    let data_dir = crate::paths::non_empty(crate::paths::DATA_DIR_ENV)
-        .map(|d| format!("{}={} ", crate::paths::DATA_DIR_ENV, crate::hook::shell_quote(&d)))
-        .unwrap_or_default();
-    let cmd = std::iter::once(l.exe.to_string_lossy().into_owned())
-        .chain(ask_args(l))
-        .map(|a| crate::hook::shell_quote(&a))
-        .collect::<Vec<_>>()
-        .join(" ");
-    format!("{data_dir}{cmd}")
-}
-
-/// The `claude` argv (after the binary) for the session `meet ask` starts itself.
+/// The `claude` argv (after the binary): the system prompt file, the session directory
+/// readable without a prompt, a name, the model, and the first prompt.
 pub fn claude_args(l: &Launch) -> Vec<String> {
     let mut args = vec![
         "--append-system-prompt-file".to_string(),
@@ -177,61 +121,16 @@ pub fn claude_args(l: &Launch) -> Vec<String> {
     args
 }
 
-/// Open the session where this `meet` can: nebula, then tmux, else say what to run.
-pub async fn open(l: &Launch) -> Result<Opened> {
-    let mut notes = Vec::new();
-    if crate::paths::non_empty("NEBULA_AGENT_ID").is_some() {
-        match nebula_spawn(l).await {
-            Ok(()) => return Ok(Opened::Nebula),
-            Err(e) => notes.push(format!("nebula: {e:#}")),
-        }
-    }
-    if crate::paths::non_empty("TMUX").is_some() {
-        match tmux_split(l).await {
-            Ok(()) => return Ok(Opened::Tmux),
-            Err(e) => notes.push(format!("tmux: {e:#}")),
-        }
-    }
-    let cmd = ask_command(l);
-    if notes.is_empty() {
-        Ok(Opened::Manual(cmd))
-    } else {
-        Ok(Opened::Manual(format!("{cmd}  ({})", notes.join("; "))))
-    }
-}
-
-/// `nebula spawn <starting prompt>`: a Claude session beside the one `meet` runs in.
-async fn nebula_spawn(l: &Launch) -> Result<()> {
-    let out = tokio::process::Command::new("nebula")
-        .arg("spawn")
-        .arg("--kind")
-        .arg("claude")
-        .arg(starting_prompt(&l.ctx))
-        .current_dir(&l.ctx.repo)
-        .output()
-        .await
-        .context("run nebula spawn")?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        bail!("{}", if err.is_empty() { "nebula spawn failed".into() } else { err });
-    }
-    Ok(())
-}
-
-/// A pane to the right of `meet` running `meet ask`.
-async fn tmux_split(l: &Launch) -> Result<()> {
-    let out = tokio::process::Command::new("tmux")
-        .args(["split-window", "-h", "-c"])
-        .arg(&l.ctx.repo)
-        .arg(ask_command(l))
-        .output()
-        .await
-        .context("run tmux split-window")?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        bail!("{}", if err.is_empty() { "tmux split-window failed".into() } else { err });
-    }
-    Ok(())
+/// Extra environment for the session, for hooks or skills the user may have.
+pub fn claude_env(ctx: &AskContext) -> Vec<(String, String)> {
+    vec![
+        ("MEET_MEETING_ID".into(), ctx.meeting_id.clone()),
+        (
+            "MEET_SESSION_DIR".into(),
+            ctx.session_dir.to_string_lossy().into_owned(),
+        ),
+        ("MEET_REPO".into(), ctx.repo.to_string_lossy().into_owned()),
+    ]
 }
 
 /// `meet ask`: pick the meeting, make sure its files are there, replace this process with
@@ -251,10 +150,8 @@ pub fn run_cli(
     let row = pick_meeting(&meetings, meeting.as_deref())?;
     let ctx = AskContext::new(repo.clone(), &row.id, row.ended_at.is_none());
     ensure_files(&store, row, &ctx)?;
-    std::fs::write(ctx.system_file(), system_prompt(&ctx))
-        .with_context(|| format!("write {}", ctx.system_file().display()))?;
+    ctx.write_system_file()?;
     let l = Launch {
-        exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("meet")),
         claude_bin,
         model,
         effort,
@@ -267,15 +164,15 @@ pub fn run_cli(
         if l.ctx.live { "recording now" } else { "ended" }
     );
     eprintln!("transcript: {}", l.ctx.transcript().display());
-    let err = std::process::Command::new(&l.claude_bin)
-        .args(claude_args(&l))
+    let mut cmd = std::process::Command::new(&l.claude_bin);
+    cmd.args(claude_args(&l))
         .current_dir(&repo)
         .env_remove("CLAUDECODE")
-        .env_remove("CLAUDE_CODE_ENTRYPOINT")
-        .env("MEET_MEETING_ID", &l.ctx.meeting_id)
-        .env("MEET_SESSION_DIR", &l.ctx.session_dir)
-        .env("MEET_REPO", &repo)
-        .exec();
+        .env_remove("CLAUDE_CODE_ENTRYPOINT");
+    for (k, v) in claude_env(&l.ctx) {
+        cmd.env(k, v);
+    }
+    let err = cmd.exec();
     Err(anyhow::Error::new(err).context(format!("exec {}", l.claude_bin)))
 }
 
@@ -296,11 +193,12 @@ pub fn pick_meeting<'a>(meetings: &'a [MeetingRow], id: Option<&str>) -> Result<
         .unwrap_or(&meetings[0]))
 }
 
-/// A meeting recorded before `meet` wrote live files (or whose files were deleted) gets
-/// them now, from the database; a meeting that has them is left alone — its `meet` is
-/// still appending to them.
-fn ensure_files(store: &Store, m: &MeetingRow, ctx: &AskContext) -> Result<()> {
-    if ctx.transcript().is_file() {
+/// The files a question session reads. A meeting that ended gets both written now, from
+/// the database — the definitive record, whatever an earlier launch left in them. A live
+/// meeting's files are left alone when they exist (its `meet` is still appending to them)
+/// and written from the database only when they are missing.
+pub fn ensure_files(store: &Store, m: &MeetingRow, ctx: &AskContext) -> Result<()> {
+    if ctx.live && ctx.transcript().is_file() {
         return Ok(());
     }
     let header = live::transcript_header(
@@ -343,7 +241,6 @@ mod tests {
 
     fn launch() -> Launch {
         Launch {
-            exe: "/usr/local/bin/meet".into(),
             claude_bin: "claude".into(),
             model: Some("sonnet".into()),
             effort: None,
@@ -365,34 +262,11 @@ mod tests {
         assert!(system_prompt(&past).contains("A meeting was recorded;"));
         let f = first_prompt(&ctx());
         assert!(f.starts_with("Read /data/sessions/01m/transcript.md and /data/sessions/01m/summary.md now."));
-        let both = starting_prompt(&ctx());
-        assert!(both.starts_with(&s) && both.ends_with(&f));
-        assert!(both.len() < 16 * 1024, "nebula caps the starting prompt at 16 KiB");
     }
 
     #[test]
-    fn the_commands_carry_the_meeting_the_model_and_the_context() {
+    fn the_claude_argv_carries_the_context_the_name_and_the_model() {
         let l = launch();
-        assert_eq!(
-            ask_args(&l),
-            vec!["ask", "--meeting", "01m", "--model", "sonnet", "/w/my-app"]
-        );
-        let cmd = ask_command(&l);
-        assert!(
-            cmd.ends_with("/usr/local/bin/meet ask --meeting 01m --model sonnet /w/my-app"),
-            "{cmd}"
-        );
-        match crate::paths::non_empty(crate::paths::DATA_DIR_ENV) {
-            Some(d) => assert!(cmd.starts_with(&format!("MEET_DATA_DIR={d} ")), "{cmd}"),
-            None => assert!(cmd.starts_with('/'), "{cmd}"),
-        }
-        let mut l2 = launch();
-        l2.claude_bin = "/tmp/fake claude".into();
-        l2.effort = Some("low".into());
-        let cmd = ask_command(&l2);
-        assert!(cmd.contains("/usr/local/bin/meet --claude-bin '/tmp/fake claude' ask "), "{cmd}");
-        assert!(cmd.contains("--effort low"), "{cmd}");
-
         let args = claude_args(&l);
         assert_eq!(
             &args[..6],
@@ -408,6 +282,13 @@ mod tests {
         assert_eq!(&args[6..8], &["--model", "sonnet"]);
         assert_eq!(args.last().unwrap(), &first_prompt(&ctx()));
         assert!(!args.contains(&"-p".to_string()), "interactive, not headless");
+        let mut l2 = launch();
+        l2.effort = Some("low".into());
+        let args = claude_args(&l2);
+        assert!(args.windows(2).any(|w| w == ["--effort", "low"]));
+        let env = claude_env(&ctx());
+        assert!(env.contains(&("MEET_MEETING_ID".to_string(), "01m".to_string())));
+        assert!(env.contains(&("MEET_SESSION_DIR".to_string(), "/data/sessions/01m".to_string())));
     }
 
     #[test]
@@ -437,7 +318,15 @@ mod tests {
         let id = store.insert_meeting("/w/my-app").unwrap();
         store.insert_segment(&id, "mic", "hello there", 1.0, 2.0).unwrap();
         let c = store.insert_chunk(&id, 0, 1.0, 2.0, "hello there").unwrap();
-        store.set_chunk_summary(&c, "a greeting").unwrap();
+        store
+            .set_chunk_lookup(
+                &c,
+                &crate::lookup::Lookup {
+                    summary: "a greeting".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         store.set_meeting_summary(&id, "Someone said hello.").unwrap();
         store.end_meeting(&id, 1).unwrap();
         let row = store.list_meetings("/w/my-app").unwrap().remove(0);
@@ -454,9 +343,28 @@ mod tests {
         assert!(s.contains("state: ended"), "{s}");
         assert!(s.contains("## Meeting summary\nSomeone said hello.\n"), "{s}");
         assert!(s.contains("[1] 00:01–00:02 a greeting\n"), "{s}");
-        // A second call leaves the files alone.
-        std::fs::write(ctx.transcript(), "kept\n").unwrap();
+        // The meeting ended: every call writes the definitive files from the database.
+        std::fs::write(ctx.transcript(), "stale\n").unwrap();
+        std::fs::write(ctx.summary(), "stale\n").unwrap();
         ensure_files(&store, &row, &ctx).unwrap();
+        assert_eq!(std::fs::read_to_string(ctx.transcript()).unwrap(), t);
+        assert_eq!(std::fs::read_to_string(ctx.summary()).unwrap(), s);
+        // A live meeting's files are its own meet's: left alone when they exist.
+        let live = AskContext {
+            live: true,
+            ..ctx.clone()
+        };
+        std::fs::write(ctx.transcript(), "kept\n").unwrap();
+        ensure_files(&store, &row, &live).unwrap();
         assert_eq!(std::fs::read_to_string(ctx.transcript()).unwrap(), "kept\n");
+        std::fs::remove_file(ctx.transcript()).unwrap();
+        ensure_files(&store, &row, &live).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(ctx.transcript()).unwrap(),
+            t,
+            "and written when missing"
+        );
+        let sys = ctx.write_system_file().unwrap();
+        assert!(std::fs::read_to_string(sys).unwrap().contains("A meeting was recorded;"));
     }
 }

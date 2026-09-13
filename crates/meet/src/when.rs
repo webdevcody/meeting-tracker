@@ -11,6 +11,12 @@ pub fn local_time(secs: i64) -> String {
     format!("{h:02}:{mi:02}")
 }
 
+/// `MM-DD HH:MM`: a session bar tab, where the year would only cost room.
+pub fn short_datetime(secs: i64) -> String {
+    let (_, mo, d, h, mi) = local_parts(secs);
+    format!("{mo:02}-{d:02} {h:02}:{mi:02}")
+}
+
 fn local_parts(secs: i64) -> (i32, u32, u32, u32, u32) {
     let t: libc::time_t = secs as libc::time_t;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
@@ -51,6 +57,7 @@ mod tests {
         assert_eq!(&s[4..5], "-");
         assert_eq!(&s[10..11], " ");
         assert_eq!(local_time(1_756_000_000), &s[11..]);
+        assert_eq!(short_datetime(1_756_000_000), &s[5..]);
         assert_eq!(human_duration(30), "30s");
         assert_eq!(human_duration(2520), "42m");
         assert_eq!(human_duration(3900), "1h 05m");

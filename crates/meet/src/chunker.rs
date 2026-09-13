@@ -79,6 +79,13 @@ impl Chunker {
         }
     }
 
+    /// Start over for the next recording: whatever is pending goes (a recording that
+    /// ended was flushed already) and the clock is back at zero.
+    pub fn reset(&mut self) {
+        self.pending.clear();
+        self.last_end = 0.0;
+    }
+
     pub fn pending_words(&self) -> usize {
         self.pending
             .iter()

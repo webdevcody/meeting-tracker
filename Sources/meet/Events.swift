@@ -4,7 +4,10 @@ import Foundation
 /// TUI), with every human-readable line moved to stderr. One event per line, one line per
 /// event, written unbuffered so a consumer sees a segment the moment it is final.
 ///
-/// Events (`"event"` key): `config`, `started`, `status`, `segment`, `paused`, `finished`.
+/// Events (`"event"` key): `config`, `started`, `status`, `segment`, `paused`, `muted`
+/// (`source` and whether it now is), `finished`, then `hooks` (how many onDone hooks will run) and a `hook` pair (`phase` `start` /
+/// `end`) around each one — or, after a discard (`D` on stdin), `discarded` alone: the
+/// meeting directory was deleted, nothing was written and no hook ran.
 enum Events {
     nonisolated(unsafe) private(set) static var enabled = false
     private static let lock = NSLock()

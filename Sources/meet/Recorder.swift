@@ -2,9 +2,14 @@ import AVFoundation
 import Foundation
 import Synchronization
 
-/// Owns the audio sources and per-source file writers, applies the pause gate, keeps every
-/// track locked to one shared recording clock, and fans each source's buffers out to an
-/// AsyncStream for the transcriber.
+/// Owns the audio sources and per-source file writers, applies the pause gate and the
+/// per-source mute gate, keeps every track locked to one shared recording clock, and fans
+/// each source's buffers out to an AsyncStream for the transcriber.
+///
+/// Mute: a muted source keeps capturing, but every buffer it delivers is replaced with
+/// silence of the same length before it reaches the file and the transcriber — the track
+/// stays in sync with the others and the transcriber hears nothing, so a muted stretch is
+/// silence in the audio and absent from the transcript.
 ///
 /// Alignment: each capture callback comes with the host-clock time of its first frame. A
 /// track's expected position is that time on the recording clock (pauses excluded); when a
@@ -95,6 +100,9 @@ final class Recorder {
     private var mic: MicCapture?
     private var stopped = false
 
+    /// Sources whose audio is being replaced with silence (touched from audio threads).
+    private let muted = Mutex<Set<Source>>([])
+
     // liveness: last time each source delivered a buffer (touched from audio threads)
     private let lastBuffer = Mutex<[Source: Date]>([:])
     private var lastRestartAttempt: [Source: Date] = [:]
@@ -125,6 +133,16 @@ final class Recorder {
     func setPaused(_ p: Bool) {
         let now = Self.hostNow()
         clock.withLock { $0.setPaused(p, at: now) }
+    }
+
+    /// Mutes (or unmutes) one source: from the next buffer on, its audio is written and
+    /// transcribed as silence. Takes effect at once, from any thread.
+    func setMuted(_ source: Source, _ m: Bool) {
+        muted.withLock { if m { $0.insert(source) } else { $0.remove(source) } }
+    }
+
+    func isMuted(_ source: Source) -> Bool {
+        muted.withLock { $0.contains(source) }
     }
 
     /// Starts the shared recording clock. Call at the same moment as `Session.start()` so
@@ -181,13 +199,20 @@ final class Recorder {
         guard let position = clock.withLock({ $0.position(at: t) }) else { return }
         let expected = Self.frame(at: position)
         let duration = Double(buffer.frameLength) / buffer.format.sampleRate
+        let isMuted = muted.withLock { $0.contains(source) }
         queue.async { [self] in
             guard !stopped, var p = pipelines[source] else { return }
             defer { pipelines[source] = p }
+            // The watchdog sees the real buffer: it is about whether the tap delivers
+            // anything at all, which a mute must not hide.
             if source == .system { watchdog(buffer) }
             p.lastEnd = t + duration
 
             var buffer = buffer
+            if isMuted {
+                guard let silence = AVAudioPCMBuffer.silence(format: buffer.format, frames: buffer.frameLength) else { return }
+                buffer = silence
+            }
             if position < 0 {
                 // Captured (partly) before the clock started: keep only the part after 0:00.
                 guard let rest = buffer.dropping(firstFrames: AVAudioFrameCount(-position * buffer.format.sampleRate)) else { return }

@@ -3,7 +3,7 @@
 //! with everything an agent run leaves behind (branch, worktree, Claude session id, PR URL,
 //! log). One mutex-guarded connection — the write volume is a few rows a minute.
 
-use crate::lookup::Fact;
+use crate::lookup::{Fact, Lookup};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
@@ -74,6 +74,19 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE meetings ADD COLUMN summary TEXT;
     ALTER TABLE chunks ADD COLUMN facts TEXT;
+    ",
+    // 4: the lookup also reports contradictions (what was said against what the code or
+    // an earlier meeting shows) and the questions worth asking, kept per chunk like the
+    // facts (JSON arrays), so the Related pane shows them per summary, live or read back.
+    "
+    ALTER TABLE chunks ADD COLUMN contradictions TEXT;
+    ALTER TABLE chunks ADD COLUMN questions TEXT;
+    ",
+    // 5: besides the short summary, the meeting keeps the write-up the action-item writer
+    // produces with it (Markdown: summary, key points, decisions, open questions, action
+    // items), so the Summary pane can show it live and read it back for a past session.
+    "
+    ALTER TABLE meetings ADD COLUMN notes TEXT;
     ",
 ];
 
@@ -179,6 +192,8 @@ pub struct ChunkRow {
     pub text: String,
     pub summary: Option<String>,
     pub facts: Vec<Fact>,
+    pub contradictions: Vec<Fact>,
+    pub questions: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -278,6 +293,16 @@ impl Store {
         Ok(id)
     }
 
+    /// The meeting's recording starts now: its start moves to this moment, so a launch
+    /// that sat idle for a while before `r` is dated by when the talking began.
+    pub fn restart_meeting(&self, id: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE meetings SET started_at = ?2 WHERE id = ?1",
+            params![id, now()],
+        )?;
+        Ok(())
+    }
+
     pub fn set_meeting_dir(&self, id: &str, dir: &str) -> Result<()> {
         self.conn.lock().unwrap().execute(
             "UPDATE meetings SET meeting_dir = ?2 WHERE id = ?1",
@@ -294,12 +319,82 @@ impl Store {
         Ok(())
     }
 
+    /// The meeting's write-up (Markdown), written with its summary and action items.
+    pub fn set_meeting_notes(&self, id: &str, notes: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE meetings SET notes = ?2 WHERE id = ?1",
+            params![id, notes],
+        )?;
+        Ok(())
+    }
+
+    /// The write-up, when one was written (an empty one reads as none).
+    pub fn meeting_notes(&self, id: &str) -> Result<Option<String>> {
+        let notes: Option<String> = self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT notes FROM meetings WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(notes.filter(|n| !n.trim().is_empty()))
+    }
+
     pub fn end_meeting(&self, id: &str, segment_count: i64) -> Result<()> {
         self.conn.lock().unwrap().execute(
             "UPDATE meetings SET ended_at = ?2, segment_count = ?3 WHERE id = ?1",
             params![id, now(), segment_count],
         )?;
         Ok(())
+    }
+
+    /// Drop a meeting and everything under it (segments, chunks, action items).
+    pub fn delete_meeting(&self, id: &str) -> Result<()> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM meetings WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// Whether nothing was ever said, looked up or suggested in this meeting — a launch
+    /// that was closed again without a recording.
+    pub fn meeting_is_empty(&self, id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row(
+            "SELECT (SELECT COUNT(*) FROM segments WHERE meeting_id = ?1)
+                  + (SELECT COUNT(*) FROM chunks WHERE meeting_id = ?1)
+                  + (SELECT COUNT(*) FROM action_items WHERE meeting_id = ?1)",
+            params![id],
+            |r| r.get(0),
+        )?;
+        Ok(n == 0)
+    }
+
+    /// Delete this repo's meetings that hold nothing at all — launches that were closed
+    /// again without a word being said (or crashed before one was) — so opening and
+    /// closing `meet` does not pile up empty sessions. Returns the ids dropped, so their
+    /// live-file directories can go too.
+    pub fn delete_empty_meetings(&self, repo_path: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let ids: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT id FROM meetings m WHERE repo_path = ?1
+                   AND NOT EXISTS (SELECT 1 FROM segments WHERE meeting_id = m.id)
+                   AND NOT EXISTS (SELECT 1 FROM chunks WHERE meeting_id = m.id)
+                   AND NOT EXISTS (SELECT 1 FROM action_items WHERE meeting_id = m.id)",
+            )?;
+            let rows = stmt.query_map(params![repo_path], |r| r.get(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for id in &ids {
+            conn.execute("DELETE FROM meetings WHERE id = ?1", params![id])?;
+        }
+        Ok(ids)
     }
 
     /// A meeting the last `meet` never closed (it crashed, or was killed) ends when its
@@ -398,19 +493,14 @@ impl Store {
         Ok(id)
     }
 
-    pub fn set_chunk_summary(&self, id: &str, summary: &str) -> Result<()> {
+    /// The lookup's whole answer for a chunk, in one write.
+    pub fn set_chunk_lookup(&self, id: &str, lookup: &Lookup) -> Result<()> {
+        let facts = serde_json::to_string(&lookup.facts)?;
+        let contradictions = serde_json::to_string(&lookup.contradictions)?;
+        let questions = serde_json::to_string(&lookup.questions)?;
         self.conn.lock().unwrap().execute(
-            "UPDATE chunks SET summary = ?2 WHERE id = ?1",
-            params![id, summary],
-        )?;
-        Ok(())
-    }
-
-    pub fn set_chunk_facts(&self, id: &str, facts: &[Fact]) -> Result<()> {
-        let json = serde_json::to_string(facts)?;
-        self.conn.lock().unwrap().execute(
-            "UPDATE chunks SET facts = ?2 WHERE id = ?1",
-            params![id, json],
+            "UPDATE chunks SET summary = ?2, facts = ?3, contradictions = ?4, questions = ?5 WHERE id = ?1",
+            params![id, lookup.summary, facts, contradictions, questions],
         )?;
         Ok(())
     }
@@ -418,7 +508,8 @@ impl Store {
     pub fn get_chunk(&self, id: &str) -> Result<Option<ChunkRow>> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT id, meeting_id, idx, start_secs, end_secs, text, summary, facts FROM chunks WHERE id = ?1",
+            "SELECT id, meeting_id, idx, start_secs, end_secs, text, summary, facts, contradictions, questions
+             FROM chunks WHERE id = ?1",
             params![id],
             row_to_chunk,
         )
@@ -426,12 +517,12 @@ impl Store {
         .map_err(Into::into)
     }
 
-    /// A meeting's chunks in order, summaries and facts included.
+    /// A meeting's chunks in order, with everything the lookup found for them.
     pub fn list_chunks(&self, meeting_id: &str) -> Result<Vec<ChunkRow>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, meeting_id, idx, start_secs, end_secs, text, summary, facts FROM chunks
-             WHERE meeting_id = ?1 ORDER BY idx",
+            "SELECT id, meeting_id, idx, start_secs, end_secs, text, summary, facts, contradictions, questions
+             FROM chunks WHERE meeting_id = ?1 ORDER BY idx",
         )?;
         let rows = stmt.query_map(params![meeting_id], row_to_chunk)?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -583,11 +674,21 @@ fn row_to_chunk(r: &rusqlite::Row<'_>) -> rusqlite::Result<ChunkRow> {
         end_secs: r.get(4)?,
         text: r.get(5)?,
         summary: r.get(6)?,
-        facts: r
-            .get::<_, Option<String>>(7)?
-            .and_then(|j| serde_json::from_str(&j).ok())
-            .unwrap_or_default(),
+        facts: json_list(r, 7)?,
+        contradictions: json_list(r, 8)?,
+        questions: json_list(r, 9)?,
     })
+}
+
+/// A JSON array stored as text; an absent or unreadable column reads as empty.
+fn json_list<T: serde::de::DeserializeOwned>(
+    r: &rusqlite::Row<'_>,
+    idx: usize,
+) -> rusqlite::Result<Vec<T>> {
+    Ok(r
+        .get::<_, Option<String>>(idx)?
+        .and_then(|j| serde_json::from_str(&j).ok())
+        .unwrap_or_default())
 }
 
 fn row_to_item(r: &rusqlite::Row<'_>) -> rusqlite::Result<ActionItem> {
@@ -621,16 +722,39 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let meeting = store.insert_meeting("/repo").unwrap();
         let chunk = store.insert_chunk(&meeting, 0, 0.0, 30.0, "hello").unwrap();
-        store.set_chunk_summary(&chunk, "said hello").unwrap();
+        store
+            .set_chunk_lookup(
+                &chunk,
+                &Lookup {
+                    summary: "said hello".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         let row = store.get_chunk(&chunk).unwrap().unwrap();
         assert_eq!(row.summary.as_deref(), Some("said hello"));
         assert!(row.facts.is_empty(), "no facts yet");
-        let facts = vec![Fact {
-            text: "README says hello".into(),
-            where_: "README.md:1".into(),
-        }];
-        store.set_chunk_facts(&chunk, &facts).unwrap();
-        assert_eq!(store.get_chunk(&chunk).unwrap().unwrap().facts, facts);
+        assert!(row.contradictions.is_empty());
+        assert!(row.questions.is_empty());
+        let lookup = Lookup {
+            summary: "hello, and a claim".into(),
+            facts: vec![Fact {
+                text: "README says hello".into(),
+                where_: "README.md:1".into(),
+            }],
+            contradictions: vec![Fact {
+                text: "said goodbye; README says hello".into(),
+                where_: "README.md:1".into(),
+            }],
+            questions: vec!["hello or goodbye?".into()],
+        };
+        store.set_chunk_lookup(&chunk, &lookup).unwrap();
+        let row = store.get_chunk(&chunk).unwrap().unwrap();
+        assert_eq!(row.summary.as_deref(), Some("hello, and a claim"));
+        assert_eq!(row.facts, lookup.facts);
+        assert_eq!(row.contradictions, lookup.contradictions);
+        assert_eq!(row.questions, lookup.questions);
+        assert_eq!(store.list_chunks(&meeting).unwrap(), vec![row]);
 
         let a = store
             .insert_item(
@@ -720,7 +844,15 @@ mod tests {
             .insert_segment(&m1, "typed", "ship it", 4.0, 4.0)
             .unwrap();
         let c = store.insert_chunk(&m1, 0, 0.0, 4.0, "…").unwrap();
-        store.set_chunk_summary(&c, "greetings and a decision").unwrap();
+        store
+            .set_chunk_lookup(
+                &c,
+                &Lookup {
+                    summary: "greetings and a decision".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         // The last meet crashed: m1 was never ended.
         assert_eq!(store.close_stale_meetings("/repo").unwrap(), 1);
         let m2 = store.insert_meeting("/repo").unwrap();
@@ -747,6 +879,70 @@ mod tests {
         let meetings = store.list_meetings("/repo").unwrap();
         assert_eq!(meetings[1].summary.as_deref(), Some("the whole thing"));
         assert_eq!(meetings[0].ended_at, None, "the live meeting stays open");
+        assert_eq!(store.meeting_notes(&m1).unwrap(), None, "no write-up yet");
+        store.set_meeting_notes(&m1, " \n").unwrap();
+        assert_eq!(store.meeting_notes(&m1).unwrap(), None, "a blank write-up is none");
+        store
+            .set_meeting_notes(&m1, "## Summary\nGreetings.\n\n## Decisions\n- ship it\n")
+            .unwrap();
+        assert_eq!(
+            store.meeting_notes(&m1).unwrap().as_deref(),
+            Some("## Summary\nGreetings.\n\n## Decisions\n- ship it\n")
+        );
+        assert_eq!(store.meeting_notes("nope").unwrap(), None);
+    }
+
+    #[test]
+    fn empty_meetings_are_dropped_and_ones_with_anything_in_them_are_kept() {
+        let store = Store::open_in_memory().unwrap();
+        let spoken = store.insert_meeting("/repo").unwrap();
+        store
+            .insert_segment(&spoken, "mic", "hello", 0.0, 1.0)
+            .unwrap();
+        let suggested = store.insert_meeting("/repo").unwrap();
+        store
+            .insert_item(&suggested, None, "/repo", "T", "p", "")
+            .unwrap();
+        let looked_up = store.insert_meeting("/repo").unwrap();
+        store.insert_chunk(&looked_up, 0, 0.0, 1.0, "t").unwrap();
+        let empty_open = store.insert_meeting("/repo").unwrap();
+        let empty_ended = store.insert_meeting("/repo").unwrap();
+        store.end_meeting(&empty_ended, 0).unwrap();
+        let elsewhere = store.insert_meeting("/other").unwrap();
+        assert!(store.meeting_is_empty(&empty_open).unwrap());
+        assert!(!store.meeting_is_empty(&spoken).unwrap());
+        assert!(!store.meeting_is_empty(&suggested).unwrap());
+        assert!(!store.meeting_is_empty(&looked_up).unwrap());
+
+        let mut dropped = store.delete_empty_meetings("/repo").unwrap();
+        dropped.sort();
+        let mut expect = vec![empty_open.clone(), empty_ended.clone()];
+        expect.sort();
+        assert_eq!(dropped, expect, "open or ended, an empty meeting goes");
+        let kept: Vec<String> = store
+            .list_meetings("/repo")
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(kept.len(), 3);
+        for id in [&spoken, &suggested, &looked_up] {
+            assert!(kept.contains(id), "{id} was dropped");
+        }
+        assert_eq!(
+            store.list_meetings("/other").unwrap()[0].id,
+            elsewhere,
+            "another repo's empty meeting is not this repo's business"
+        );
+        assert!(store.delete_empty_meetings("/repo").unwrap().is_empty());
+
+        store.delete_meeting(&spoken).unwrap();
+        assert!(store.list_segments(&spoken).unwrap().is_empty(), "cascaded");
+        assert_eq!(store.list_meetings("/repo").unwrap().len(), 2);
+        assert!(
+            store.meeting_is_empty("nope").unwrap(),
+            "an unknown id holds nothing"
+        );
     }
 
     #[test]
@@ -791,5 +987,8 @@ mod tests {
         let meetings = s.list_meetings("/r").unwrap();
         assert_eq!(meetings[0].summary, None);
         s.set_meeting_summary("m", "s").unwrap();
+        assert_eq!(s.meeting_notes("m").unwrap(), None);
+        s.set_meeting_notes("m", "## Summary\ns\n").unwrap();
+        assert_eq!(s.meeting_notes("m").unwrap().as_deref(), Some("## Summary\ns\n"));
     }
 }

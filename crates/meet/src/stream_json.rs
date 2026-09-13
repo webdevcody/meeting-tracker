@@ -3,6 +3,71 @@
 
 use serde_json::Value;
 
+/// Tokens a call read and wrote, and what claude said it cost. Adds up across calls.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Usage {
+    /// Fresh input tokens.
+    pub input: u64,
+    /// Input tokens served from the prompt cache.
+    pub cache_read: u64,
+    /// Input tokens written to the prompt cache.
+    pub cache_write: u64,
+    pub output: u64,
+    /// `total_cost_usd`; only the final `result` carries one.
+    pub cost_usd: f64,
+}
+
+impl Usage {
+    /// The `usage` object claude prints on `assistant` messages and on the `result`.
+    pub fn from_value(v: &Value) -> Usage {
+        let n = |k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
+        Usage {
+            input: n("input_tokens"),
+            cache_read: n("cache_read_input_tokens"),
+            cache_write: n("cache_creation_input_tokens"),
+            output: n("output_tokens"),
+            cost_usd: 0.0,
+        }
+    }
+
+    /// Everything the model read: fresh, cached and cache-written input.
+    pub fn input_total(&self) -> u64 {
+        self.input + self.cache_read + self.cache_write
+    }
+
+    pub fn is_zero(&self) -> bool {
+        self.input_total() == 0 && self.output == 0 && self.cost_usd == 0.0
+    }
+}
+
+impl std::ops::AddAssign for Usage {
+    fn add_assign(&mut self, o: Usage) {
+        self.input += o.input;
+        self.cache_read += o.cache_read;
+        self.cache_write += o.cache_write;
+        self.output += o.output;
+        self.cost_usd += o.cost_usd;
+    }
+}
+
+impl std::ops::Add for Usage {
+    type Output = Usage;
+    fn add(mut self, o: Usage) -> Usage {
+        self += o;
+        self
+    }
+}
+
+/// `1234` → `1.2k`, `45678` → `46k`, `1234567` → `1.2M`.
+pub fn tokens_short(n: u64) -> String {
+    match n {
+        0..=999 => n.to_string(),
+        1_000..=9_999 => format!("{:.1}k", n as f64 / 1_000.0),
+        10_000..=999_999 => format!("{}k", n / 1_000),
+        _ => format!("{:.1}M", n as f64 / 1_000_000.0),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum StreamItem {
     /// The session started; `session_id` is what `claude --resume` takes later.
@@ -19,13 +84,33 @@ pub enum StreamItem {
         text: String,
         cost_usd: Option<f64>,
         duration_ms: Option<u64>,
+        /// The whole run's tokens, cost included, when the result carried them.
+        usage: Option<Usage>,
     },
     /// Anything else (rate-limit notices, hooks).
     Other,
 }
 
+#[cfg(test)]
 pub fn parse_line(line: &str) -> Option<StreamItem> {
     let v: Value = serde_json::from_str(line.trim()).ok()?;
+    parse_value(&v)
+}
+
+/// An `assistant` line's API turn: the message id and what that turn read and wrote.
+/// One turn streams as several `assistant` lines (thinking, text, tool_use) that share
+/// the id and the usage, so a tally must count each id once. The `output_tokens` on
+/// these is a placeholder (`1`) while the turn streams; only the `result` has the real one.
+pub fn turn_usage(v: &Value) -> Option<(String, Usage)> {
+    if v.get("type").and_then(Value::as_str) != Some("assistant") {
+        return None;
+    }
+    let id = v.pointer("/message/id")?.as_str()?.to_string();
+    let usage = Usage::from_value(v.pointer("/message/usage")?);
+    Some((id, usage))
+}
+
+pub fn parse_value(v: &Value) -> Option<StreamItem> {
     let kind = v.get("type")?.as_str()?;
     Some(match kind {
         "system" if v.get("subtype").and_then(Value::as_str) == Some("init") => StreamItem::Init {
@@ -100,9 +185,18 @@ pub fn parse_line(line: &str) -> Option<StreamItem> {
                 .to_string(),
             cost_usd: v.get("total_cost_usd").and_then(Value::as_f64),
             duration_ms: v.get("duration_ms").and_then(Value::as_u64),
+            usage: result_usage(v),
         },
         _ => StreamItem::Other,
     })
+}
+
+/// The `usage` of a `result` envelope (`claude -p --output-format json` or the last
+/// stream-json line), with its `total_cost_usd` folded in.
+pub fn result_usage(v: &Value) -> Option<Usage> {
+    let mut u = Usage::from_value(v.get("usage")?);
+    u.cost_usd = v.get("total_cost_usd").and_then(Value::as_f64).unwrap_or(0.0);
+    Some(u)
 }
 
 /// The one input field worth showing per tool, on one line.
@@ -175,16 +269,28 @@ mod tests {
         let text = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"done"}]}}"#;
         assert_eq!(parse_line(text), Some(StreamItem::Text("done".into())));
 
-        let end = r#"{"type":"result","subtype":"success","is_error":false,"result":"done","total_cost_usd":0.15,"duration_ms":4855}"#;
+        let end = r#"{"type":"result","subtype":"success","is_error":false,"result":"done","total_cost_usd":0.15,"duration_ms":4855,"usage":{"input_tokens":18,"cache_creation_input_tokens":26729,"cache_read_input_tokens":26503,"output_tokens":171}}"#;
         assert_eq!(
             parse_line(end),
             Some(StreamItem::Result {
                 is_error: false,
                 text: "done".into(),
                 cost_usd: Some(0.15),
-                duration_ms: Some(4855)
+                duration_ms: Some(4855),
+                usage: Some(Usage {
+                    input: 18,
+                    cache_write: 26729,
+                    cache_read: 26503,
+                    output: 171,
+                    cost_usd: 0.15,
+                }),
             })
         );
+        let bare = r#"{"type":"result","subtype":"success","is_error":false,"result":"done"}"#;
+        assert!(matches!(
+            parse_line(bare),
+            Some(StreamItem::Result { usage: None, .. })
+        ));
         let err = r#"{"type":"result","subtype":"error_max_turns","is_error":false,"result":""}"#;
         assert!(matches!(
             parse_line(err),
@@ -196,6 +302,47 @@ mod tests {
             Some(StreamItem::Other)
         );
         assert_eq!(parse_line("not json"), None);
+    }
+
+    #[test]
+    fn a_turn_is_counted_by_its_message_id_and_usage_adds_up() {
+        let v: Value = serde_json::from_str(r#"{"type":"assistant","message":{"id":"msg_1","role":"assistant","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":10,"cache_creation_input_tokens":26503,"cache_read_input_tokens":0,"output_tokens":1}}}"#).unwrap();
+        let (id, u) = turn_usage(&v).unwrap();
+        assert_eq!(id, "msg_1");
+        assert_eq!(u.input_total(), 26513);
+        assert_eq!(u.output, 1);
+        let user: Value = serde_json::from_str(r#"{"type":"user","message":{"content":[]}}"#).unwrap();
+        assert!(turn_usage(&user).is_none());
+        let no_usage: Value =
+            serde_json::from_str(r#"{"type":"assistant","message":{"id":"m","content":[]}}"#).unwrap();
+        assert!(turn_usage(&no_usage).is_none());
+
+        let mut total = Usage::default();
+        assert!(total.is_zero());
+        total += u;
+        total += Usage {
+            input: 5,
+            output: 40,
+            cost_usd: 0.02,
+            ..Default::default()
+        };
+        assert_eq!(total.input, 15);
+        assert_eq!(total.input_total(), 26518);
+        assert_eq!(total.output, 41);
+        assert_eq!(total.cost_usd, 0.02);
+        assert!(!total.is_zero());
+        assert_eq!((total + total).output, 82);
+    }
+
+    #[test]
+    fn tokens_read_short() {
+        assert_eq!(tokens_short(0), "0");
+        assert_eq!(tokens_short(999), "999");
+        assert_eq!(tokens_short(1234), "1.2k");
+        assert_eq!(tokens_short(9960), "10.0k");
+        assert_eq!(tokens_short(45678), "45k");
+        assert_eq!(tokens_short(999_999), "999k");
+        assert_eq!(tokens_short(1_234_567), "1.2M");
     }
 
     #[test]

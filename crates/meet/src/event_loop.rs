@@ -2,33 +2,45 @@
 //! suggester and the agent runs, and a one-second tick, all on one `tokio::select!`;
 //! redraws when something changed.
 //!
-//! While the recording goes, every closed chunk is looked up (summary + related facts).
-//! `x` stops the recording and stays: the whole transcript then goes to the suggester
-//! once, and the action items land on the board. On launch, agents the last `meet` took
-//! down with it are resumed before anything else (unless `--no-resume`); on quit, running
-//! agents get a SIGTERM so Claude flushes their sessions, and their rows stay `running`
-//! for the next launch to pick up.
+//! Nothing records until `r`. While the recording goes, every closed chunk is looked up
+//! (summary, facts, contradictions, questions). `x` stops the recording and stays: the
+//! whole transcript then goes to the suggester once, and the action items land on the
+//! board; `r` then starts the next recording as a new session (the ended one is closed
+//! and slides along the bar), and whatever is still working on the ended meeting — its
+//! summary call, the engine's onDone hooks — finishes in the background and lands on it:
+//! recorder events are tagged with the recorder they came from, and the suggester's
+//! answer with its meeting. On launch, agents the last `meet` took down with it are
+//! resumed before anything else (unless `--no-resume`); on quit, running agents get a
+//! SIGTERM so Claude flushes their sessions, and their rows stay `running` for the next
+//! launch to pick up. A session that is closed again without a word said is dropped (and
+//! any such leftovers from a crash on the way in), so the session bar holds only real
+//! sessions.
 
 use crate::app::{
-    fact_views, App, ChunkState, Overlay, RecState, RightPane, SessionView, TranscriptLine,
+    App, ChunkState, Overlay, RecState, RightPane, SessionView, TranscriptLine,
     WrapUp,
 };
-use crate::ask::{self, AskContext, AskEvent, Opened};
+use crate::ask::{self, AskContext};
+use crate::engine_hook::HookState;
+use crate::term::{Spawn, Term, TermEvent};
 use crate::chunker::{Chunk, Limits};
+use crate::knowledge;
+use crate::layout::{HitTarget, LayoutPrefs, PointerShape, Splitter};
 use crate::live::{self, LiveFiles};
 use crate::lookup::{self, LookupConfig, LookupEvent, LookupRequest};
 use crate::recorder::{self, RecorderEvent, RecorderHandle, Segment};
 use crate::runner::{spawn_run, RunContext, RunEvent};
+use crate::settings::{self, Feature, Field, Settings};
 use crate::store::{ActionItem, ItemStatus, Store};
 use crate::suggest::{self, SuggestEvent, SuggestRequest, SuggesterConfig};
 use crate::{config, git, ui};
 use anyhow::{Context, Result};
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::collections::HashMap;
-use std::io::Stdout;
+use std::io::{Stdout, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
@@ -44,16 +56,11 @@ pub struct Opts {
     pub config: Option<String>,
     pub claude_bin: String,
     pub gh_bin: String,
-    pub lookup_model: Option<String>,
-    pub lookup_effort: Option<String>,
+    /// The `--*-model` / `--*-effort` flags passed this launch; they win over the settings.
+    pub overrides: settings::Overrides,
     pub lookup_budget_usd: f64,
     pub no_lookup: bool,
-    pub suggest_model: Option<String>,
-    pub agent_model: Option<String>,
     pub suggest_budget_usd: f64,
-    /// The question session's model and effort (`a`, `meet ask`).
-    pub ask_model: Option<String>,
-    pub ask_effort: Option<String>,
     pub no_suggest: bool,
     /// Leave interrupted agents stopped instead of resuming them on launch.
     pub no_resume: bool,
@@ -64,11 +71,24 @@ pub struct Opts {
 }
 
 const FRAME: Duration = Duration::from_millis(33);
+/// How the footer names the key that takes the keys back from the question session.
+pub const UNFOCUS_HINT: &str = "Ctrl+q";
+/// Lines one wheel notch scrolls.
+const WHEEL_LINES: i32 = 3;
 const TICK: Duration = Duration::from_secs(1);
 /// How long to wait for the engine to write the transcript after `q`.
 const FINALIZE_FOR: Duration = Duration::from_secs(45);
+/// How long a discard (`D`) waits for the engine to delete the meeting directory and exit
+/// before meet leaves anyway (and deletes the directory itself).
+const DISCARD_FOR: Duration = Duration::from_secs(10);
 /// How long running agents get to exit on SIGTERM when meet quits.
 const AGENT_EXIT_GRACE: Duration = Duration::from_millis(1500);
+
+/// What `r` starts.
+enum Source {
+    Engine { path: PathBuf, args: Vec<String> },
+    Replay { segments: Vec<Segment>, speed: f64 },
+}
 
 struct Loop {
     app: App,
@@ -76,13 +96,27 @@ struct Loop {
     /// The transcript and summary files under `<data dir>/sessions/<meeting id>/`, for
     /// the question session; `None` when the directory could not be created.
     live: Option<LiveFiles>,
-    recorder: RecorderHandle,
+    /// The engine, or the replay, of the recording going on; `None` while none is.
+    recorder: Option<RecorderHandle>,
+    /// How `r` starts one.
+    source: Source,
+    /// Where every recorder reports, tagged with which one it is, so the events of one
+    /// still finishing (its onDone hooks) when the next recording starts are told apart.
+    rec_tx: mpsc::UnboundedSender<(u64, RecorderEvent)>,
+    /// The recorder started last; events tagged with an earlier number are a predecessor's.
+    rec_gen: u64,
     lookup_tx: mpsc::UnboundedSender<LookupRequest>,
     suggest_cfg: SuggesterConfig,
     suggest_tx: mpsc::UnboundedSender<SuggestEvent>,
     run_tx: mpsc::UnboundedSender<RunEvent>,
     run_ctx: RunContext,
-    ask_tx: mpsc::UnboundedSender<AskEvent>,
+    /// Output and exits of the question terminals, tagged with the meeting each is about.
+    term_tx: mpsc::UnboundedSender<(String, TermEvent)>,
+    /// The lookup worker reads this before every call; `apply_settings` writes it.
+    lookup_cfg: watch::Sender<LookupConfig>,
+    /// `agent.model` from meet.json: what a `default` agent model setting falls through to.
+    config_agent_model: Option<String>,
+    /// The question session's model and effort (`a`), as the settings resolve them.
     ask_model: Option<String>,
     ask_effort: Option<String>,
     /// item id → the stop switch of its running agent.
@@ -97,9 +131,14 @@ pub async fn run(opts: Opts) -> Result<()> {
     let repo = git::toplevel(&opts.dir).await?;
     let base_branch = git::current_branch(&repo).await?;
     let cfg = config::load(opts.config.as_deref().map(Path::new), &repo)?;
+    let settings = Settings::load()?;
     let store = Store::open(&crate::paths::db_path())?;
     let repo_key = repo.to_string_lossy().into_owned();
     let _ = store.close_stale_meetings(&repo_key);
+    // Sessions a crashed launch left empty go, with their live-file directories.
+    for id in store.delete_empty_meetings(&repo_key).unwrap_or_default() {
+        let _ = std::fs::remove_dir_all(crate::paths::session_dir(&id));
+    }
     let interrupted = if opts.no_resume {
         store.stop_interrupted_items(&repo_key)?;
         Vec::new()
@@ -110,34 +149,35 @@ pub async fn run(opts: Opts) -> Result<()> {
     let meeting_id = store.insert_meeting(&repo_key)?;
     let sessions = store.list_meetings(&repo_key)?;
 
-    let (rec_tx, mut rec_rx) = mpsc::unbounded_channel::<RecorderEvent>();
-    let recorder = match &opts.replay {
-        Some(path) => {
-            let segments = recorder::load_transcript(path)?;
-            recorder::spawn_replay(segments, opts.replay_speed, rec_tx)
-        }
-        None => {
-            let engine = recorder::locate_engine(opts.recorder.as_deref())?;
-            recorder::spawn_engine(&engine, &opts.record_args, &repo, rec_tx)?
-        }
+    // Nothing records until `r`; but a missing engine or transcript is found out now.
+    let source = match &opts.replay {
+        Some(path) => Source::Replay {
+            segments: recorder::load_transcript(path)?,
+            speed: opts.replay_speed,
+        },
+        None => Source::Engine {
+            path: recorder::locate_engine(opts.recorder.as_deref())?,
+            args: opts.record_args.clone(),
+        },
     };
+    let (rec_tx, mut rec_rx) = mpsc::unbounded_channel::<(u64, RecorderEvent)>();
 
     let (lookup_tx, lookup_rx) = mpsc::unbounded_channel::<LookupRequest>();
     let (lookup_ev_tx, mut lookup_ev_rx) = mpsc::unbounded_channel::<LookupEvent>();
-    let _lookup = lookup::spawn_worker(
-        LookupConfig {
-            claude_bin: opts.claude_bin.clone(),
-            model: opts.lookup_model.clone(),
-            effort: opts.lookup_effort.clone(),
-            repo: repo.clone(),
-            max_budget_usd: opts.lookup_budget_usd,
-        },
-        lookup_rx,
-        lookup_ev_tx,
-    );
+    // The model and effort are filled in by `apply_settings`, and the knowledge brief by
+    // `refresh_knowledge`, before the first chunk.
+    let (lookup_cfg, lookup_cfg_rx) = watch::channel(LookupConfig {
+        claude_bin: opts.claude_bin.clone(),
+        model: None,
+        effort: None,
+        repo: repo.clone(),
+        max_budget_usd: opts.lookup_budget_usd,
+        knowledge: String::new(),
+    });
+    let _lookup = lookup::spawn_worker(lookup_cfg_rx, lookup_rx, lookup_ev_tx);
     let (suggest_tx, mut suggest_rx) = mpsc::unbounded_channel::<SuggestEvent>();
     let (run_tx, mut run_rx) = mpsc::unbounded_channel::<RunEvent>();
-    let (ask_tx, mut ask_rx) = mpsc::unbounded_channel::<AskEvent>();
+    let (term_tx, mut term_rx) = mpsc::unbounded_channel::<(String, TermEvent)>();
 
     let mut app = App::new(
         repo.clone(),
@@ -150,37 +190,38 @@ pub async fn run(opts: Opts) -> Result<()> {
     app.sessions = sessions;
     app.lookup_disabled = opts.no_lookup || opts.no_suggest;
     app.suggest_disabled = opts.no_suggest;
+    app.settings = settings;
+    app.overrides = opts.overrides.clone();
+    match LayoutPrefs::load() {
+        Ok(layout) => app.layout = layout,
+        Err(e) => app.push_log(format!("⚠ {e:#}; the panes take their default sizes")),
+    }
     if let Some(p) = &cfg.path {
         app.push_log(format!("agent config: {}", p.display()));
     }
+    let settings_path = Settings::path();
+    app.push_log(if settings_path.is_file() {
+        format!("settings: {}", settings_path.display())
+    } else {
+        format!(
+            "settings: built-in defaults (, in the TUI writes {})",
+            settings_path.display()
+        )
+    });
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("meet"));
-    let started = app
-        .sessions
-        .first()
-        .map(|m| crate::when::local_datetime(m.started_at))
-        .unwrap_or_default();
-    let live = match LiveFiles::create(
-        crate::paths::session_dir(&app.meeting_id),
-        &live::transcript_header(&app.repo_name, &started),
-    ) {
-        Ok(files) => {
-            app.push_log(format!("live transcript: {}", files.transcript_path().display()));
-            Some(files)
-        }
-        Err(e) => {
-            app.push_log(format!("⚠ no live transcript file: {e:#}"));
-            None
-        }
-    };
     let mut lp = Loop {
         app,
         store,
-        live,
-        recorder,
+        live: None,
+        recorder: None,
+        source,
+        rec_tx,
+        rec_gen: 0,
         lookup_tx,
         suggest_cfg: SuggesterConfig {
             claude_bin: opts.claude_bin.clone(),
-            model: opts.suggest_model.clone(),
+            model: None,
+            effort: None,
             repo: repo.clone(),
             max_budget_usd: opts.suggest_budget_usd,
         },
@@ -192,28 +233,39 @@ pub async fn run(opts: Opts) -> Result<()> {
             remote: opts.remote.clone(),
             claude_bin: opts.claude_bin.clone(),
             gh_bin: opts.gh_bin.clone(),
-            agent_model: opts.agent_model.clone().or(cfg.agent.model.clone()),
+            agent_model: None,
+            agent_effort: None,
             meeting_context: String::new(),
             on_done: opts.on_done.clone().or(cfg.agent.on_done.clone()),
             exe,
         },
-        ask_tx,
-        ask_model: opts.ask_model.clone(),
-        ask_effort: opts.ask_effort.clone(),
+        term_tx,
+        lookup_cfg,
+        config_agent_model: cfg.agent.model.clone(),
+        ask_model: None,
+        ask_effort: None,
         stops: HashMap::new(),
         finalize_deadline: None,
         stop_deadline: None,
     };
+    lp.apply_settings();
+    lp.refresh_knowledge();
+    lp.open_live_files();
+    let models = lp.models_line();
+    lp.app.push_log(format!("models: {models}"));
     if lp.run_ctx.on_done.is_some() {
         lp.app
             .push_log("on-done prompt configured; agents get it through a Stop hook".into());
     }
+    lp.app.push_log("nothing is recording — r starts the recording".into());
     lp.resume_interrupted(interrupted);
 
     let mut terminal = setup_terminal()?;
     let mut input = crossterm::event::EventStream::new();
     let mut next_draw = tokio::time::Instant::now();
     let mut next_tick = tokio::time::Instant::now() + TICK;
+    // The pointer shape last asked of the terminal, so hovering a seam asks once.
+    let mut pointer_sent = PointerShape::Default;
     let result: Result<()> = loop {
         if lp.app.dirty && tokio::time::Instant::now() >= next_draw {
             if let Err(e) = terminal.draw(|f| ui::draw(f, &mut lp.app)) {
@@ -249,16 +301,25 @@ pub async fn run(opts: Opts) -> Result<()> {
             }
             ev = input.next() => match ev {
                 Some(Ok(Event::Key(key))) => lp.on_key(key),
+                Some(Ok(Event::Mouse(m))) => lp.on_mouse(m),
                 Some(Ok(Event::Resize(_, _))) => lp.app.dirty = true,
                 Some(Ok(_)) => {}
                 Some(Err(e)) => break Err(e.into()),
                 None => break Ok(()),
             },
-            ev = rec_rx.recv() => if let Some(ev) = ev { lp.on_recorder(ev) },
+            ev = rec_rx.recv() => if let Some((gen, ev)) = ev { lp.on_recorder(gen, ev) },
             ev = lookup_ev_rx.recv() => if let Some(ev) = ev { lp.on_lookup(ev) },
             ev = suggest_rx.recv() => if let Some(ev) = ev { lp.on_suggest(ev) },
             ev = run_rx.recv() => if let Some(ev) = ev { lp.on_run(ev) },
-            ev = ask_rx.recv() => if let Some(ev) = ev { lp.on_ask(ev) },
+            ev = term_rx.recv() => if let Some((id, ev)) = ev { lp.on_term(&id, ev) },
+        }
+        // The pointer shape (OSC 22): resize arrows over a seam. Terminals that do not
+        // know the escape drop it.
+        if lp.app.pointer_shape != pointer_sent {
+            pointer_sent = lp.app.pointer_shape;
+            let backend = terminal.backend_mut();
+            let _ = write!(backend, "\x1b]22;{}\x1b\\", pointer_sent.osc_name());
+            let _ = backend.flush();
         }
         lp.flush_live();
         if lp.app.should_quit {
@@ -266,10 +327,29 @@ pub async fn run(opts: Opts) -> Result<()> {
         }
     };
     restore_terminal();
-    let segs = lp.app.transcript.len() as i64;
-    let _ = lp.store.end_meeting(&lp.app.meeting_id, segs);
-    if let Some(dir) = &lp.app.meeting_dir {
-        eprintln!("meeting saved to {dir}");
+    for term in lp.app.terms.values_mut() {
+        term.kill();
+    }
+    if lp.app.discard {
+        // A discarded recording leaves nothing behind: not the session, not its live files,
+        // and not the engine's meeting directory (the engine deletes it itself; this catches
+        // one it did not get to).
+        let _ = lp.store.delete_meeting(&lp.app.meeting_id);
+        let _ = std::fs::remove_dir_all(crate::paths::session_dir(&lp.app.meeting_id));
+        if let Some(dir) = lp
+            .app
+            .meeting_dir
+            .as_deref()
+            .filter(|d| std::path::Path::new(d).is_dir())
+        {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        eprintln!("recording discarded — nothing was kept");
+    } else {
+        lp.close_meeting();
+        if let Some(dir) = &lp.app.meeting_dir {
+            eprintln!("meeting saved to {dir}");
+        }
     }
     let done: Vec<_> = lp
         .app
@@ -373,7 +453,7 @@ impl Loop {
 
     /// A closed chunk goes to the live lookup.
     fn enqueue_chunk(&mut self, chunk: Chunk) {
-        if self.app.lookup_disabled {
+        if self.app.lookup_disabled || self.app.discard {
             return;
         }
         let idx = self.app.chunks.len() as i64;
@@ -389,6 +469,7 @@ impl Loop {
                 return;
             }
         };
+        let previous_text = self.app.chunks.last().map(|c| c.text.clone());
         let idx = self.app.add_chunk(id.clone(), &chunk);
         let req = LookupRequest {
             chunk_id: id,
@@ -396,16 +477,24 @@ impl Loop {
             chunk_text: text,
             start: chunk.start,
             end: chunk.end,
+            previous_text,
             summaries_so_far: self.app.summaries(),
             facts_so_far: self.app.fact_lines(),
+            contradictions_so_far: self.app.contradiction_lines(),
+            questions_so_far: self.app.question_lines(),
         };
         let _ = self.lookup_tx.send(req);
     }
 
-    /// The recording is over: the whole transcript goes to the suggester once, and the
-    /// board takes the right pane. Skipped when quitting, or when nothing was said.
+    /// The recording is over: the whole transcript goes to the suggester once — for the
+    /// meeting's summary, its write-up and its action items — and the Summary pane takes
+    /// the right pane to show that, and the engine's hooks, at work. Skipped when
+    /// quitting, or when nothing was said.
     fn wrap_up(&mut self) {
-        if self.app.wrap_up != WrapUp::NotYet || self.finalize_deadline.is_some() {
+        if self.app.wrap_up != WrapUp::NotYet
+            || self.finalize_deadline.is_some()
+            || self.app.discard
+        {
             return;
         }
         if self.app.suggest_disabled {
@@ -416,20 +505,23 @@ impl Loop {
         if transcript.trim().is_empty() {
             self.app.wrap_up = WrapUp::Done;
             self.app
-                .flash("nothing was said — no action items to write".into(), true);
+                .flash("nothing was said — no summary or action items to write".into(), true);
             return;
         }
         self.app.wrap_up = WrapUp::Writing;
         self.app.live_stale = true;
         if self.app.session.is_none() {
-            self.app.show_items();
+            self.app.show_summary();
         }
         suggest::spawn(
             self.suggest_cfg.clone(),
             SuggestRequest {
+                meeting_id: self.app.meeting_id.clone(),
                 transcript,
                 summaries: self.app.summaries(),
                 facts: self.app.fact_lines(),
+                contradictions: self.app.contradiction_lines(),
+                questions: self.app.question_lines(),
                 board: self.app.board(),
             },
             self.suggest_tx.clone(),
@@ -437,14 +529,57 @@ impl Loop {
         self.app.dirty = true;
     }
 
-    /// Ask before stopping the recording — there is no starting it again.
+    /// Ask before stopping the recording — the next one is a new session.
     fn confirm_end(&mut self) {
         if !self.app.is_live() {
-            self.app
-                .flash("the recording has already ended".into(), true);
+            let msg = match self.app.rec {
+                RecState::Idle => "nothing is recording — r starts the recording",
+                RecState::Finalizing => "the recording is already stopping",
+                _ => "the recording has already ended — r starts the next one",
+            };
+            self.app.flash(msg.into(), true);
             return;
         }
         self.app.overlay = Some(Overlay::ConfirmEnd);
+        self.app.dirty = true;
+    }
+
+    /// Ask before throwing the recording away — there is no getting it back.
+    fn confirm_discard(&mut self) {
+        if !self.app.is_live() {
+            self.app.flash(
+                "the recording has already ended and is kept — D discards only a live recording"
+                    .into(),
+                true,
+            );
+            return;
+        }
+        if self.app.session.is_some() {
+            self.app.flash(
+                "Esc back to the live meeting first — D discards the live recording".into(),
+                true,
+            );
+            return;
+        }
+        self.app.overlay = Some(Overlay::ConfirmDiscard);
+        self.app.dirty = true;
+    }
+
+    /// Throw the recording away and quit: the engine stops, deletes its meeting directory
+    /// and runs no hook; nothing more is looked up or written; the session is deleted on
+    /// the way out (see the end of `run`).
+    fn discard_now(&mut self) {
+        self.app.overlay = None;
+        if !self.app.is_live() {
+            return;
+        }
+        self.app.discard = true;
+        self.app.rec = RecState::Finalizing;
+        self.app.status_text = Some("discarding the recording…".into());
+        if let Some(r) = &self.recorder {
+            r.discard();
+        }
+        self.finalize_deadline = Some(tokio::time::Instant::now() + DISCARD_FOR);
         self.app.dirty = true;
     }
 
@@ -456,12 +591,233 @@ impl Loop {
         }
         self.app.rec = RecState::Finalizing;
         self.app.status_text = Some("stopping the recording…".into());
-        self.recorder.stop();
+        if let Some(r) = &self.recorder {
+            r.stop();
+        }
         self.stop_deadline = Some(tokio::time::Instant::now() + FINALIZE_FOR);
         self.app.dirty = true;
     }
 
-    fn on_recorder(&mut self, ev: RecorderEvent) {
+    // ----- starting a recording -----
+
+    /// `r`: start recording. The first time, into the session this launch opened (dated
+    /// from now, not from the launch); after a recording ended, into a new session — the
+    /// ended one is closed and slides along the bar, and the transcript, the summaries,
+    /// the clock and the Related pane start over. Whatever is still working on the ended
+    /// meeting (its summary call, the engine's onDone hooks) finishes in the background
+    /// and lands on that meeting.
+    fn start_recording(&mut self) {
+        if self.app.discard {
+            return;
+        }
+        if self.app.session.is_some() {
+            self.view_session(0);
+        }
+        match self.app.rec {
+            RecState::Idle => {
+                if let Err(e) = self.store.restart_meeting(&self.app.meeting_id) {
+                    self.app
+                        .push_log(format!("⚠ could not date the session: {e:#}"));
+                }
+                self.refresh_sessions();
+            }
+            RecState::Ended | RecState::Failed(_) => {
+                if !self.open_next_meeting() {
+                    return;
+                }
+            }
+            RecState::Finalizing => {
+                self.app.flash(
+                    "the recording is still stopping — r once it has ended".into(),
+                    true,
+                );
+                return;
+            }
+            RecState::Starting | RecState::Recording | RecState::Paused => {
+                self.app
+                    .flash("already recording — x stops it".into(), true);
+                return;
+            }
+        }
+        self.open_live_files();
+        self.spawn_recorder();
+    }
+
+    /// The live meeting is over for good — meet quits, or the next recording opens a new
+    /// one: its row ends now, or goes (with its live files) when nothing was ever said in
+    /// it, so the bar holds only meetings that happened.
+    fn close_meeting(&mut self) {
+        let id = self.app.meeting_id.clone();
+        let segs = self.app.transcript.len() as i64;
+        let empty = segs == 0
+            && self.app.chunks.is_empty()
+            && !self.app.items.iter().any(|i| i.meeting_id == id)
+            && self.store.meeting_is_empty(&id).unwrap_or(false);
+        if empty {
+            let _ = self.store.delete_meeting(&id);
+            let _ = std::fs::remove_dir_all(crate::paths::session_dir(&id));
+        } else {
+            let _ = self.store.end_meeting(&id, segs);
+        }
+    }
+
+    /// A recording ended here and the next one is starting: close this meeting and open
+    /// a new one for it. `false` when the database would not take the new row.
+    fn open_next_meeting(&mut self) -> bool {
+        self.close_meeting();
+        let id = match self.store.insert_meeting(&self.repo_key()) {
+            Ok(id) => id,
+            Err(e) => {
+                self.app
+                    .push_log(format!("⚠ could not open a new session: {e:#}"));
+                return false;
+            }
+        };
+        self.app.begin_meeting(id);
+        self.refresh_sessions();
+        // The meeting that just ended is a past one now: what it concluded goes with
+        // every lookup of the new one.
+        self.refresh_knowledge();
+        self.app.flash(
+            "new session — the last one is on the bar to the right".into(),
+            false,
+        );
+        true
+    }
+
+    /// `app.sessions` from the database again, after a row was opened, closed or re-dated.
+    fn refresh_sessions(&mut self) {
+        match self.store.list_meetings(&self.repo_key()) {
+            Ok(list) => self.app.sessions = list,
+            Err(e) => self
+                .app
+                .push_log(format!("⚠ could not list the sessions: {e:#}")),
+        }
+        self.app.bar_first = 0;
+        self.app.dirty = true;
+    }
+
+    /// What earlier meetings here concluded — sent with every lookup of this one. On
+    /// launch, and again when a new meeting opens (the one that just ended counts then).
+    fn refresh_knowledge(&mut self) {
+        let past: Vec<_> = self
+            .app
+            .sessions
+            .iter()
+            .filter(|m| m.id != self.app.meeting_id)
+            .take(knowledge::MAX_MEETINGS * 2)
+            .map(|m| (m.clone(), self.store.list_chunks(&m.id).unwrap_or_default()))
+            .collect();
+        let brief = knowledge::brief(&past, &self.app.items);
+        self.lookup_cfg.send_modify(|c| c.knowledge = brief);
+    }
+
+    /// The live meeting's transcript and summary files, fresh (a new header, dated by the
+    /// session), for the question session: on launch, and again when a recording starts.
+    fn open_live_files(&mut self) {
+        let started = self
+            .app
+            .sessions
+            .first()
+            .map(|m| crate::when::local_datetime(m.started_at))
+            .unwrap_or_default();
+        self.live = match LiveFiles::create(
+            crate::paths::session_dir(&self.app.meeting_id),
+            &live::transcript_header(&self.app.repo_name, &started),
+        ) {
+            Ok(files) => {
+                self.app.push_log(format!(
+                    "live transcript: {}",
+                    files.transcript_path().display()
+                ));
+                Some(files)
+            }
+            Err(e) => {
+                self.app
+                    .push_log(format!("⚠ no live transcript file: {e:#}"));
+                None
+            }
+        };
+        self.app.live_stale = true;
+    }
+
+    /// Start the engine (or the replay) for the live meeting; its events arrive tagged as
+    /// the newest recorder's. A start that fails leaves the meeting idle, for `r` again.
+    fn spawn_recorder(&mut self) {
+        self.rec_gen += 1;
+        let gen = self.rec_gen;
+        let (tx, mut rx) = mpsc::unbounded_channel::<RecorderEvent>();
+        let out = self.rec_tx.clone();
+        tokio::spawn(async move {
+            while let Some(ev) = rx.recv().await {
+                if out.send((gen, ev)).is_err() {
+                    break;
+                }
+            }
+        });
+        let handle = match &self.source {
+            Source::Replay { segments, speed } => {
+                Ok(recorder::spawn_replay(segments.clone(), *speed, tx))
+            }
+            Source::Engine { path, args } => {
+                recorder::spawn_engine(path, args, &self.app.repo, tx)
+            }
+        };
+        self.stop_deadline = None;
+        self.finalize_deadline = None;
+        match handle {
+            Ok(h) => {
+                self.recorder = Some(h);
+                self.app.rec = RecState::Starting;
+                self.app.status_text = None;
+                self.app.push_log(match &self.source {
+                    Source::Replay { .. } => "replay started".to_string(),
+                    Source::Engine { path, .. } => {
+                        format!("recorder started: {}", path.display())
+                    }
+                });
+            }
+            Err(e) => {
+                self.recorder = None;
+                self.app
+                    .push_log(format!("⚠ could not start the recorder: {e:#}"));
+            }
+        }
+        self.app.dirty = true;
+        self.app.live_stale = true;
+    }
+
+    /// An event from the recorder of a meeting that has since been left for the next one
+    /// — it was still running its onDone hooks when `r` was pressed. What it prints stays
+    /// in the log; the live state is the new recorder's and is left alone.
+    fn on_previous_recorder(&mut self, ev: RecorderEvent) {
+        match ev {
+            RecorderEvent::Log(line) => self.app.push_log(line),
+            RecorderEvent::HookEnded {
+                index,
+                status,
+                secs,
+            } => self.app.push_log(format!(
+                "the previous recording's hook {index} {} after {secs:.0} s",
+                if status == 0 {
+                    "finished".to_string()
+                } else {
+                    format!("exited {status}")
+                }
+            )),
+            RecorderEvent::Exited { code } => self.app.push_log(format!(
+                "the previous recorder exited{}",
+                code.map(|c| format!(" with status {c}")).unwrap_or_default()
+            )),
+            _ => {}
+        }
+    }
+
+    fn on_recorder(&mut self, gen: u64, ev: RecorderEvent) {
+        if gen != self.rec_gen {
+            self.on_previous_recorder(ev);
+            return;
+        }
         match ev {
             RecorderEvent::Config { path, .. } => {
                 if !path.is_empty() {
@@ -485,8 +841,60 @@ impl Loop {
             RecorderEvent::Status(t) => self.app.on_status(t),
             RecorderEvent::Segment(seg) => self.push_segment(seg),
             RecorderEvent::Paused(p) => self.app.on_paused(p),
+            RecorderEvent::Muted { source, muted } => self.app.on_muted(source, muted),
             RecorderEvent::Clock(secs) => self.app.on_clock(secs),
-            RecorderEvent::Log(line) => self.app.push_log(line),
+            RecorderEvent::Log(line) => {
+                // While an onDone hook runs, what the engine prints is the hook's.
+                self.app.hooks.on_output(&line);
+                self.app.push_log(line);
+            }
+            RecorderEvent::Hooks { count, skipped } => {
+                self.app.hooks.on_announced(count, skipped);
+                if skipped {
+                    self.app.push_log("onDone hooks skipped (--no-hooks)".into());
+                } else if count > 0 {
+                    self.app.push_log(format!(
+                        "the engine runs {count} onDone hook{} now",
+                        if count == 1 { "" } else { "s" }
+                    ));
+                }
+                self.app.dirty = true;
+            }
+            RecorderEvent::HookStarted {
+                index,
+                count,
+                command,
+            } => {
+                self.app.hooks.on_started(index, count, command);
+                let name = self.app.hooks.running().map(|r| r.name()).unwrap_or_default();
+                self.app.flash(
+                    format!("hook {index}/{count} {name} is running — m shows its output"),
+                    false,
+                );
+            }
+            RecorderEvent::HookEnded {
+                index,
+                status,
+                secs,
+            } => {
+                let Some(run) = self.app.hooks.on_ended(index, status, secs) else {
+                    return;
+                };
+                let name = run.name();
+                let (msg, warn) = match (&run.state, &run.wrote) {
+                    (HookState::Failed(code), _) => (
+                        format!("⚠ hook {name} exited {code} after {secs:.0} s — m shows its output"),
+                        true,
+                    ),
+                    (_, Some((path, _))) => (
+                        format!("hook {name} wrote {} in {secs:.0} s — m shows it", path.display()),
+                        false,
+                    ),
+                    (_, None) => (format!("hook {name} done in {secs:.0} s"), false),
+                };
+                self.app.push_log(msg.clone());
+                self.app.flash(msg, warn);
+            }
             RecorderEvent::Finished { meeting_dir, .. } => {
                 self.stop_deadline = None;
                 if !meeting_dir.is_empty() {
@@ -502,8 +910,18 @@ impl Loop {
                 self.app.flash(msg, false);
                 self.wrap_up();
             }
+            RecorderEvent::Discarded { meeting_dir } => {
+                self.stop_deadline = None;
+                if !meeting_dir.is_empty() {
+                    self.app.meeting_dir = Some(meeting_dir);
+                }
+                self.app.on_discarded();
+                self.app
+                    .push_log("recording discarded — nothing kept, no hook run".into());
+            }
             RecorderEvent::Exited { code } => {
                 self.stop_deadline = None;
+                self.app.hooks.on_engine_exited();
                 if let Some(chunk) = self.app.on_engine_exited(code) {
                     self.enqueue_chunk(chunk);
                 }
@@ -527,22 +945,32 @@ impl Loop {
                 self.app.dirty = true;
                 self.app.live_stale = true;
             }
-            LookupEvent::Done { chunk_id, lookup } => {
-                let _ = self.store.set_chunk_summary(&chunk_id, &lookup.summary);
-                let _ = self.store.set_chunk_facts(&chunk_id, &lookup.facts);
-                if let Some(m) = self.app.sessions.first_mut() {
-                    if m.summary.is_none() {
-                        m.summary = Some(lookup.summary.clone());
+            LookupEvent::Done {
+                chunk_id,
+                lookup,
+                usage,
+            } => {
+                self.app.add_usage(usage);
+                let _ = self.store.set_chunk_lookup(&chunk_id, &lookup);
+                // A chunk of the live meeting (not of one left behind for a new
+                // recording): its first summary describes the session until the
+                // meeting's own is written.
+                if self.app.chunks.iter().any(|c| c.id == chunk_id) {
+                    if let Some(m) = self.app.sessions.first_mut() {
+                        if m.summary.is_none() {
+                            m.summary = Some(lookup.summary.clone());
+                        }
                     }
                 }
-                self.app
-                    .on_lookup_done(&chunk_id, lookup.summary, &lookup.facts);
+                self.app.on_lookup_done(&chunk_id, lookup);
             }
             LookupEvent::Failed {
                 chunk_id,
                 chunk_idx,
                 error,
+                usage,
             } => {
+                self.app.add_usage(usage);
                 if let Some(c) = self.app.chunk_mut(&chunk_id) {
                     c.state = ChunkState::Failed(crate::stream_json::excerpt(&error, 120));
                 }
@@ -557,20 +985,44 @@ impl Loop {
 
     fn on_suggest(&mut self, ev: SuggestEvent) {
         match ev {
-            SuggestEvent::Done(suggestion) => {
+            SuggestEvent::Done {
+                meeting_id,
+                suggestion,
+                usage,
+            } => {
+                self.app.add_usage(usage);
+                // The answer is the live meeting's — unless `r` opened the next one
+                // while it was being written: then it lands on its own meeting, which is
+                // a past session by now.
+                let current = meeting_id == self.app.meeting_id;
                 let _ = self
                     .store
-                    .set_meeting_summary(&self.app.meeting_id, &suggestion.summary);
-                self.app.meeting_summary = Some(suggestion.summary.clone());
-                self.app.live_stale = true;
-                if let Some(m) = self.app.sessions.first_mut() {
+                    .set_meeting_summary(&meeting_id, &suggestion.summary);
+                if !suggestion.notes.is_empty() {
+                    let _ = self
+                        .store
+                        .set_meeting_notes(&meeting_id, &suggestion.notes);
+                    self.app
+                        .notes
+                        .insert(meeting_id.clone(), suggestion.notes.clone());
+                }
+                if let Some(m) = self.app.sessions.iter_mut().find(|m| m.id == meeting_id) {
                     m.summary = Some(suggestion.summary.clone());
+                }
+                if let Some(v) = &mut self.app.session {
+                    if v.meeting.id == meeting_id {
+                        v.meeting.summary = Some(suggestion.summary.clone());
+                    }
+                }
+                if current {
+                    self.app.meeting_summary = Some(suggestion.summary.clone());
+                    self.app.live_stale = true;
                 }
                 let repo_key = self.repo_key();
                 let mut new = Vec::new();
                 for s in &suggestion.items {
                     match self.store.insert_item(
-                        &self.app.meeting_id,
+                        &meeting_id,
                         None,
                         &repo_key,
                         &s.title,
@@ -585,25 +1037,41 @@ impl Loop {
                 }
                 let n = new.len();
                 self.app.insert_items(new);
-                self.app.wrap_up = WrapUp::Done;
-                let msg = match (n, self.app.session.is_some()) {
-                    (0, _) => "no action items came out of this meeting".to_string(),
-                    (n, true) => format!(
-                        "{n} action item{} on the live board",
-                        if n == 1 { "" } else { "s" }
+                if current {
+                    self.app.wrap_up = WrapUp::Done;
+                }
+                let plural = if n == 1 { "" } else { "s" };
+                let msg = match (n, current, self.app.session.is_some(), self.app.right_pane) {
+                    (0, false, _, _) => {
+                        "the previous meeting's summary is written — no action items came out of it".to_string()
+                    }
+                    (n, false, _, _) => format!(
+                        "the previous meeting's summary is written · {n} action item{plural} on the board"
                     ),
-                    (n, false) => format!(
-                        "{n} action item{} — Enter runs the selected one",
-                        if n == 1 { "" } else { "s" }
+                    (0, true, _, _) => "summary written — no action items came out of this meeting".to_string(),
+                    (n, true, true, _) => format!("summary written · {n} action item{plural} on the live board"),
+                    (n, true, false, RightPane::Items) => {
+                        format!("summary written · {n} action item{plural} — Enter runs the selected one")
+                    }
+                    (n, true, false, _) => format!(
+                        "summary written · {n} action item{plural} — Tab shows the board, m the summary"
                     ),
                 };
                 self.app.flash(msg, false);
             }
-            SuggestEvent::Failed(error) => {
-                self.app.wrap_up = WrapUp::Failed(crate::stream_json::excerpt(&error, 160));
-                self.app.live_stale = true;
-                self.app
-                    .push_log(format!("⚠ could not write the action items: {error}"));
+            SuggestEvent::Failed {
+                meeting_id,
+                error,
+                usage,
+            } => {
+                self.app.add_usage(usage);
+                if meeting_id == self.app.meeting_id {
+                    self.app.wrap_up = WrapUp::Failed(crate::stream_json::excerpt(&error, 160));
+                    self.app.live_stale = true;
+                }
+                self.app.push_log(format!(
+                    "⚠ could not write the summary and action items: {error}"
+                ));
             }
         }
     }
@@ -653,6 +1121,13 @@ impl Loop {
             RunEvent::Activity { item_id, text } => {
                 self.app.activity.insert(item_id, text);
                 self.app.dirty = true;
+            }
+            RunEvent::Usage {
+                item_id,
+                usage,
+                ended,
+            } => {
+                self.app.on_agent_usage(&item_id, usage, ended);
             }
             RunEvent::Finished { item_id, outcome } => {
                 self.stops.remove(&item_id);
@@ -799,98 +1274,302 @@ impl Loop {
 
     // ----- the question session -----
 
-    /// `a`: a Claude Code session to ask about the meeting, opened where this `meet` can
-    /// (nebula, tmux) or named as the command to run elsewhere. One per launch.
+    /// `a`: Claude Code in the right pane, with the keys, about the session on screen —
+    /// the live meeting, or the past session the bar is on. Starts the session on an
+    /// embedded terminal the first time (and again after it exited); otherwise just
+    /// brings it back into view and hands it the keys. Each session keeps its own.
     fn ask(&mut self) {
-        if self.app.session.is_some() {
-            self.app
-                .flash("Esc back to the live meeting first".into(), true);
-            return;
-        }
-        if let Some(where_) = self.app.ask_where.clone() {
+        if self.app.term_running() {
+            self.app.focus_term();
             self.app.flash(
-                if where_.contains(" ask ") {
-                    format!("run in another terminal: {where_}")
-                } else {
-                    format!("the question session is already open {where_}")
-                },
+                format!("Claude Code has the keys — {UNFOCUS_HINT} gives them back to meet"),
                 false,
             );
             return;
         }
-        let Some(files) = &self.live else {
-            self.app.flash(
-                "no live transcript file to ask about (see the log)".into(),
-                true,
-            );
-            return;
+        let ctx = match &self.app.session {
+            Some(v) => {
+                // A past session: its files come from the database (the definitive record).
+                let ctx = AskContext::new(self.app.repo.clone(), &v.meeting.id, false);
+                if let Err(e) = ask::ensure_files(&self.store, &v.meeting, &ctx) {
+                    self.app.flash(
+                        format!("could not write the session's files: {e:#}"),
+                        true,
+                    );
+                    return;
+                }
+                ctx
+            }
+            None => {
+                let Some(files) = &self.live else {
+                    self.app.flash(
+                        "no live transcript file to ask about (see the log)".into(),
+                        true,
+                    );
+                    return;
+                };
+                let ctx = AskContext {
+                    repo: self.app.repo.clone(),
+                    meeting_id: self.app.meeting_id.clone(),
+                    session_dir: files.dir().to_path_buf(),
+                    live: self.app.is_live(),
+                };
+                self.flush_live();
+                ctx
+            }
         };
-        let ctx = AskContext {
-            repo: self.app.repo.clone(),
-            meeting_id: self.app.meeting_id.clone(),
-            session_dir: files.dir().to_path_buf(),
-            live: self.app.is_live(),
-        };
-        self.flush_live();
-        if let Err(e) = std::fs::write(ctx.system_file(), ask::system_prompt(&ctx)) {
-            self.app
-                .flash(format!("could not write the question prompt: {e}"), true);
+        if let Err(e) = ctx.write_system_file() {
+            self.app.flash(format!("could not start the question session: {e:#}"), true);
             return;
         }
+        let meeting_id = ctx.meeting_id.clone();
         let launch = ask::Launch {
-            exe: self.run_ctx.exe.clone(),
             claude_bin: self.run_ctx.claude_bin.clone(),
             model: self.ask_model.clone(),
             effort: self.ask_effort.clone(),
             ctx,
         };
-        let tx = self.ask_tx.clone();
-        tokio::spawn(async move {
-            let ev = match ask::open(&launch).await {
-                Ok(opened) => AskEvent::Opened(opened),
-                Err(e) => AskEvent::Failed(format!("{e:#}")),
-            };
-            let _ = tx.send(ev);
-        });
-        self.app
-            .flash("opening the question session…".into(), false);
-    }
-
-    fn on_ask(&mut self, ev: AskEvent) {
-        match ev {
-            AskEvent::Opened(Opened::Nebula) => {
-                self.app.ask_where = Some("beside this one in nebula".into());
-                self.app.push_log("question session started in nebula".into());
+        let args = ask::claude_args(&launch);
+        let env = ask::claude_env(&launch.ctx);
+        let (w, h) = crossterm::terminal::size().unwrap_or((120, 40));
+        let inner = ui::ask_pane_inner(ratatui::layout::Rect::new(0, 0, w, h), &self.app.layout);
+        // The terminal reports on its own channel; a task tags what it says with the
+        // meeting it is about and forwards it to the loop.
+        let (tx, mut rx) = mpsc::unbounded_channel::<TermEvent>();
+        match Term::spawn(
+            Spawn {
+                program: &launch.claude_bin,
+                args: &args,
+                cwd: &self.app.repo,
+                env: &env,
+                cols: inner.width,
+                rows: inner.height,
+            },
+            tx,
+        ) {
+            Ok(term) => {
+                let out = self.term_tx.clone();
+                let id = meeting_id.clone();
+                tokio::spawn(async move {
+                    while let Some(ev) = rx.recv().await {
+                        if out.send((id.clone(), ev)).is_err() {
+                            break;
+                        }
+                    }
+                });
+                if let Some(mut old) = self.app.terms.insert(meeting_id.clone(), term) {
+                    old.kill();
+                }
+                self.app.focus_term();
+                self.app.push_log(format!(
+                    "question session started on {}: {} {}",
+                    if self.app.session.is_some() {
+                        format!("the session of {}", self.session_label())
+                    } else {
+                        "the live meeting".to_string()
+                    },
+                    launch.claude_bin,
+                    args[..args.len() - 1].join(" ")
+                ));
                 self.app.flash(
-                    "question session started beside this one in nebula — pick it from the session list".into(),
+                    format!("Claude Code has the keys — {UNFOCUS_HINT} gives them back to meet"),
                     false,
                 );
             }
-            AskEvent::Opened(Opened::Tmux) => {
-                self.app.ask_where = Some("in the tmux pane beside meet".into());
-                self.app.push_log("question session opened in a tmux pane".into());
+            Err(e) => {
+                self.app
+                    .push_log(format!("⚠ could not start the question session: {e:#}"));
                 self.app.flash(
-                    "question session opened in a tmux pane beside meet".into(),
-                    false,
-                );
-            }
-            AskEvent::Opened(Opened::Manual(cmd)) => {
-                self.app.ask_where = Some(cmd.clone());
-                self.app
-                    .push_log(format!("question session: run in another terminal: {cmd}"));
-                self.app
-                    .flash(format!("run in another terminal: {cmd}"), false);
-            }
-            AskEvent::Failed(e) => {
-                self.app
-                    .push_log(format!("⚠ could not open the question session: {e}"));
-                self.app.flash(
-                    format!("could not open the question session: {}", crate::stream_json::excerpt(&e, 120)),
+                    format!(
+                        "could not start the question session: {}",
+                        crate::stream_json::excerpt(&format!("{e:#}"), 120)
+                    ),
                     true,
                 );
             }
         }
+    }
+
+    /// What the question terminal about `meeting_id` said, or that it exited.
+    fn on_term(&mut self, meeting_id: &str, ev: TermEvent) {
+        let shown = self.app.shown_meeting_id() == meeting_id;
+        let Some(term) = self.app.terms.get_mut(meeting_id) else {
+            return;
+        };
+        match ev {
+            TermEvent::Output(bytes) => term.process(&bytes),
+            TermEvent::Exited(code) => {
+                term.on_exited(code);
+                if shown {
+                    self.app.term_focused = false;
+                }
+                self.app.push_log(format!(
+                    "question session exited{}",
+                    code.map(|c| format!(" with status {c}")).unwrap_or_default()
+                ));
+                self.app
+                    .flash("Claude Code exited — a starts a new session".into(), false);
+            }
+        }
         self.app.dirty = true;
+    }
+
+    /// The shown session's date, for messages.
+    fn session_label(&self) -> String {
+        match &self.app.session {
+            Some(v) => crate::when::local_datetime(v.meeting.started_at),
+            None => "the live meeting".into(),
+        }
+    }
+
+    /// The terminal has the keys: everything goes to Claude except the way out.
+    fn key_to_term(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // Ctrl+q, and Ctrl+] (which arrives as Ctrl+5 from most terminals).
+        let unfocus = ctrl
+            && matches!(
+                key.code,
+                KeyCode::Char('q') | KeyCode::Char(']') | KeyCode::Char('5')
+            );
+        if unfocus {
+            self.app.term_focused = false;
+            self.app
+                .flash("keys back to meet — a returns them to Claude".into(), false);
+            self.app.dirty = true;
+            return;
+        }
+        let sent = self
+            .app
+            .term_mut()
+            .map(|term| term.send_key(&key))
+            .unwrap_or(Ok(()));
+        if let Err(e) = sent {
+            self.app
+                .flash(format!("could not reach Claude Code: {e}"), true);
+        }
+    }
+
+    // ----- settings -----
+
+    /// Resolve every feature's model and effort from the settings and this launch's flags,
+    /// and hand them to the workers: the lookup reads its config before every call, the
+    /// suggester and the runner take theirs at each start, the question session at `a`.
+    /// Shared by startup and every change in the modal, so nothing can reach one and miss
+    /// the other.
+    fn apply_settings(&mut self) {
+        let s = &self.app.settings;
+        let o = &self.app.overrides;
+        let eff = |f: Feature, field: Field, fallback: Option<&str>| {
+            settings::effective(s, f, field, o.get(f, field), fallback)
+        };
+        let lookup_model = eff(Feature::Lookup, Field::Model, None);
+        let lookup_effort = eff(Feature::Lookup, Field::Effort, None);
+        self.lookup_cfg.send_modify(|c| {
+            c.model = lookup_model;
+            c.effort = lookup_effort;
+        });
+        self.suggest_cfg.model = eff(Feature::Suggest, Field::Model, None);
+        self.suggest_cfg.effort = eff(Feature::Suggest, Field::Effort, None);
+        self.run_ctx.agent_model = eff(
+            Feature::Agent,
+            Field::Model,
+            self.config_agent_model.as_deref(),
+        );
+        self.run_ctx.agent_effort = eff(Feature::Agent, Field::Effort, None);
+        self.ask_model = eff(Feature::Ask, Field::Model, None);
+        self.ask_effort = eff(Feature::Ask, Field::Effort, None);
+    }
+
+    /// One line for the log: what each feature runs with right now.
+    fn models_line(&self) -> String {
+        let show = |m: &Option<String>, e: &Option<String>| {
+            let m = m.as_deref().unwrap_or("claude's own");
+            match e {
+                Some(e) => format!("{m} ({e})"),
+                None => m.to_string(),
+            }
+        };
+        let lookup = self.lookup_cfg.borrow();
+        format!(
+            "lookup {} · action items {} · agent {} · ask {}",
+            show(&lookup.model, &lookup.effort),
+            show(&self.suggest_cfg.model, &self.suggest_cfg.effort),
+            show(&self.run_ctx.agent_model, &self.run_ctx.agent_effort),
+            show(&self.ask_model, &self.ask_effort),
+        )
+    }
+
+    /// `,`: the settings modal, on its first row.
+    fn open_settings(&mut self) {
+        self.app.overlay = Some(Overlay::Settings {
+            cursor: 0,
+            notice: None,
+        });
+        self.app.dirty = true;
+    }
+
+    fn settings_move(&mut self, to: usize) {
+        self.app.overlay = Some(Overlay::Settings {
+            cursor: to.min(settings::ROWS.len() - 1),
+            notice: None,
+        });
+    }
+
+    /// Step the row's value, write the file, apply it: a change is live the moment it is
+    /// made. A file that cannot be written leaves the value where it was.
+    fn settings_cycle(&mut self, cursor: usize, delta: isize) {
+        let cursor = cursor.min(settings::ROWS.len() - 1);
+        let (feature, field) = settings::ROWS[cursor];
+        let mut next = self.app.settings.clone();
+        next.cycle(feature, field, delta);
+        let notice = match next.save() {
+            Ok(()) => {
+                self.app.settings = next;
+                self.apply_settings();
+                let value = self.app.settings.get(feature, field).to_string();
+                match self.app.overrides.get(feature, field) {
+                    Some(o) => (
+                        format!(
+                            "saved {value} · {} {o} wins until meet restarts",
+                            settings::flag_name(feature, field)
+                        ),
+                        true,
+                    ),
+                    None => (
+                        format!(
+                            "saved · {} {} {value} · applies to {}",
+                            feature.title().to_lowercase(),
+                            field.label(),
+                            feature.applies_to()
+                        ),
+                        false,
+                    ),
+                }
+            }
+            Err(e) => (format!("could not save the settings: {e:#}"), true),
+        };
+        self.app.overlay = Some(Overlay::Settings {
+            cursor,
+            notice: Some(notice),
+        });
+    }
+
+    /// `R`, confirmed: every setting back to its default, written and applied.
+    fn reset_settings(&mut self, cursor: usize) {
+        let mut next = self.app.settings.clone();
+        next.reset();
+        let notice = match next.save() {
+            Ok(()) => {
+                self.app.settings = next;
+                self.apply_settings();
+                ("every setting is back to its default".to_string(), false)
+            }
+            Err(e) => (format!("could not save the settings: {e:#}"), true),
+        };
+        self.app.overlay = Some(Overlay::Settings {
+            cursor,
+            notice: Some(notice),
+        });
     }
 
     // ----- sessions -----
@@ -931,10 +1610,6 @@ impl Loop {
             }
         };
         let rows = self.store.list_chunks(&meeting.id).unwrap_or_default();
-        let facts = rows
-            .iter()
-            .flat_map(|c| fact_views(c.idx.max(0) as usize, c.start_secs, &c.facts))
-            .collect();
         let chunks = rows
             .into_iter()
             .map(|c| crate::app::ChunkView {
@@ -948,30 +1623,39 @@ impl Loop {
                 } else {
                     ChunkState::Failed("no summary".into())
                 },
+                text: c.text,
                 summary: c.summary,
+                facts: c.facts,
+                contradictions: c.contradictions,
+                questions: c.questions,
             })
             .collect();
+        // Its write-up, for the Summary pane, the first time it is opened.
+        if !self.app.notes.contains_key(&meeting.id) {
+            if let Ok(Some(notes)) = self.store.meeting_notes(&meeting.id) {
+                self.app.notes.insert(meeting.id.clone(), notes);
+            }
+        }
         let label = crate::when::local_datetime(meeting.started_at);
         self.app.enter_session(SessionView {
             meeting,
             transcript,
             chunks,
-            facts,
         });
         self.app.flash(
-            format!("session {label} — ←/→ step, Esc back to live"),
+            format!("session {label} — ←/→ step, a ask Claude about it, Esc back to live"),
             false,
         );
     }
 
-    /// `←` older, `→` newer (past the newest is the live meeting).
+    /// One tab along the session bar: `→` (`l`) is older, `←` (`h`) newer — the bar has
+    /// the newest at its left end, the live meeting.
     fn step_session(&mut self, delta: isize) {
         let cur = self.app.session_index() as isize;
         let next = cur + delta;
         if next < 0 {
-            if self.app.session.is_some() {
-                self.view_session(0);
-            }
+            self.app
+                .flash("that is the newest: the live meeting".into(), true);
             return;
         }
         if next as usize >= self.app.sessions.len() {
@@ -1059,10 +1743,13 @@ impl Loop {
         });
     }
 
+    /// Ask before quitting when something would be cut short: the recording, running
+    /// agents, or the summary still being written (meet's call, or an engine hook —
+    /// quitting takes the engine down with it).
     fn request_quit(&mut self) {
         let running = self.app.running_count();
         let live = self.app.is_live();
-        if running > 0 || live {
+        if running > 0 || live || self.app.summarizing() {
             self.app.overlay = Some(Overlay::ConfirmQuit { running, live });
             self.app.dirty = true;
         } else {
@@ -1076,14 +1763,211 @@ impl Loop {
             self.app.rec = RecState::Finalizing;
             self.app.status_text = Some("stopping the recording…".into());
             self.app.dirty = true;
-            self.recorder.stop();
+            if let Some(r) = &self.recorder {
+                r.stop();
+            }
             self.finalize_deadline = Some(tokio::time::Instant::now() + FINALIZE_FOR);
         } else {
             self.app.should_quit = true;
         }
     }
 
+    /// `M` / `N`, or a click on the header's `mic` / `system`: mute that source, or
+    /// unmute it. The recorder answers with a `Muted` event, which is what flips the
+    /// header and the footer — so what is shown is always what the engine does.
+    fn toggle_mute(&mut self, source: &str) {
+        let Some(r) = self.recorder.as_ref().filter(|_| self.app.is_live()) else {
+            self.app
+                .flash("nothing is recording — r starts the recording".into(), true);
+            return;
+        };
+        if !self.app.sources.iter().any(|s| s == source) {
+            let flag = match source {
+                "mic" => " (--no-mic)",
+                "system" => " (--no-system)",
+                _ => "",
+            };
+            self.app.flash(
+                format!("no {} in this recording{flag}", crate::app::source_name(source)),
+                true,
+            );
+            return;
+        }
+        r.toggle_mute(source);
+    }
+
+    // ----- the mouse -----
+
+    /// The mouse, the way nebula has it: a click focuses what it lands on — a pane, a tab
+    /// on the right pane, a session on the bar, a summary, an action item, a row of an
+    /// overlay, a source in the header — or closes an overlay when it lands outside it;
+    /// the wheel scrolls what it is over; a press on the border between two panes grabs
+    /// the seam, dragging moves it, and the shares go to layout.json when the button
+    /// comes up.
+    fn on_mouse(&mut self, m: MouseEvent) {
+        let (x, y) = (m.column, m.row);
+        let target = self.app.hit.hit_at(x, y);
+        // Hover: the grip under the pointer lights up and the pointer turns into resize
+        // arrows (in terminals that report plain motion); a drag keeps both honest past
+        // the seam.
+        let hover = match (self.app.splitter_drag, target) {
+            (Some(drag), _) => Some(drag.which),
+            (None, HitTarget::Splitter(s)) => Some(s),
+            _ => None,
+        };
+        if hover != self.app.hover_splitter {
+            self.app.hover_splitter = hover;
+            self.app.dirty = true;
+        }
+        self.app.pointer_shape = match hover {
+            Some(Splitter::Columns) => PointerShape::ColResize,
+            Some(_) => PointerShape::RowResize,
+            None => PointerShape::Default,
+        };
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => self.click(x, y, target),
+            MouseEventKind::Drag(MouseButton::Left) => self.app.drag_splitter_to(x, y),
+            MouseEventKind::Up(MouseButton::Left) => {
+                if self.app.release_splitter() {
+                    self.save_layout();
+                }
+            }
+            MouseEventKind::ScrollUp => self.wheel(target, -WHEEL_LINES),
+            MouseEventKind::ScrollDown => self.wheel(target, WHEEL_LINES),
+            _ => {}
+        }
+    }
+
+    fn click(&mut self, x: u16, y: u16, target: HitTarget) {
+        match target {
+            HitTarget::Splitter(s) => self.app.grab_splitter(s, x, y),
+            HitTarget::Source(i) => {
+                if let Some(source) = self.app.sources.get(i).cloned() {
+                    self.toggle_mute(&source);
+                    self.app.dirty = true;
+                }
+            }
+            HitTarget::Bar(tab) => {
+                self.app.term_focused = false;
+                self.app.bar_focused = true;
+                self.app.dirty = true;
+                if let Some(i) = tab {
+                    if i != self.app.session_index() {
+                        self.view_session(i);
+                    }
+                }
+            }
+            HitTarget::Transcript | HitTarget::Summaries(None) => self.app.focus_panes(),
+            HitTarget::Summaries(Some(i)) => self.app.pick_chunk(i),
+            HitTarget::RightTab(pane) => self.app.show_pane(pane),
+            HitTarget::Items(Some(row)) => self.app.select_row(row),
+            HitTarget::Items(None) | HitTarget::Detail => self.app.focus_panes(),
+            HitTarget::Right => {
+                // Claude Code's pane: a click hands it the keys, as a does.
+                if self.app.right_pane == RightPane::Ask && self.app.term_running() {
+                    self.app.focus_term();
+                } else {
+                    self.app.focus_panes();
+                }
+            }
+            HitTarget::Overlay(Some(row)) => self.click_overlay_row(row),
+            HitTarget::Overlay(None) => {}
+            HitTarget::Outside => {
+                if self.app.overlay.is_some() {
+                    self.close_overlay_by_click();
+                }
+            }
+        }
+    }
+
+    /// A click on a row of the open overlay: a session opens, a setting is picked (and a
+    /// second click on the picked one cycles it, as Enter does).
+    fn click_overlay_row(&mut self, row: usize) {
+        match self.app.overlay.clone() {
+            Some(Overlay::Sessions { .. }) => {
+                self.app.overlay = None;
+                self.view_session(row);
+            }
+            Some(Overlay::Settings { cursor, .. }) if cursor == row => {
+                self.settings_cycle(row, 1)
+            }
+            Some(Overlay::Settings { .. }) => self.settings_move(row),
+            _ => {}
+        }
+        self.app.dirty = true;
+    }
+
+    /// A click outside the open overlay closes it, as Esc does: a confirm box answers no,
+    /// the reset confirm goes back to the settings it came from.
+    fn close_overlay_by_click(&mut self) {
+        self.app.overlay = match self.app.overlay.take() {
+            Some(Overlay::ConfirmReset { cursor }) => Some(Overlay::Settings {
+                cursor,
+                notice: None,
+            }),
+            _ => None,
+        };
+        self.app.dirty = true;
+    }
+
+    /// The wheel: `delta` lines, negative up — the transcript, the right pane and the
+    /// agent log scroll; the summaries, the action items, the session list and the
+    /// settings step their selection.
+    fn wheel(&mut self, target: HitTarget, delta: i32) {
+        let step = |v: usize| {
+            if delta < 0 {
+                v.saturating_sub(delta.unsigned_abs() as usize)
+            } else {
+                v + delta as usize
+            }
+        };
+        let up = delta < 0;
+        match target {
+            HitTarget::Overlay(_) | HitTarget::Outside if self.app.overlay.is_some() => {
+                match &mut self.app.overlay {
+                    Some(Overlay::Log { scroll, follow, .. }) => {
+                        *scroll = step(*scroll);
+                        *follow = false;
+                    }
+                    Some(Overlay::Sessions { cursor }) => {
+                        let max = self.app.sessions.len().saturating_sub(1);
+                        *cursor = if up { cursor.saturating_sub(1) } else { (*cursor + 1).min(max) };
+                    }
+                    Some(Overlay::Settings { cursor, .. }) => {
+                        let max = settings::ROWS.len() - 1;
+                        *cursor = if up { cursor.saturating_sub(1) } else { (*cursor + 1).min(max) };
+                    }
+                    _ => {}
+                }
+            }
+            HitTarget::Transcript => self.app.scroll_transcript(delta),
+            HitTarget::Summaries(_) if up => self.app.chunk_prev(),
+            HitTarget::Summaries(_) => self.app.chunk_next(),
+            HitTarget::Items(_) if up => self.app.select_prev(),
+            HitTarget::Items(_) => self.app.select_next(),
+            HitTarget::Detail | HitTarget::Right => self.app.scroll_right_pane(delta),
+            _ => {}
+        }
+        self.app.dirty = true;
+    }
+
+    /// The seams as dragged, to layout.json, for the next launch.
+    fn save_layout(&mut self) {
+        if let Err(e) = self.app.layout.save() {
+            self.app.push_log(format!(
+                "⚠ could not write {}: {e:#}",
+                LayoutPrefs::path().display()
+            ));
+            self.app
+                .flash("the layout could not be saved (see the log)".into(), true);
+        }
+    }
+
     fn on_key(&mut self, key: KeyEvent) {
+        if self.app.term_focused && self.app.overlay.is_none() {
+            self.key_to_term(key);
+            return;
+        }
         let ctrl_c =
             key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
         if let Some(overlay) = self.app.overlay.clone() {
@@ -1109,6 +1993,7 @@ impl Loop {
                     KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => self.quit_now(),
                     KeyCode::Char('c') if ctrl_c => self.quit_now(),
                     KeyCode::Char('x') | KeyCode::Char('X') if live => self.stop_recording(),
+                    KeyCode::Char('d') | KeyCode::Char('D') if live => self.confirm_discard(),
                     _ => self.app.overlay = None,
                 },
                 Overlay::ConfirmStop { item_id } => {
@@ -1121,6 +2006,12 @@ impl Loop {
                     self.app.overlay = None;
                     if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter) {
                         self.stop_recording();
+                    }
+                }
+                Overlay::ConfirmDiscard => {
+                    self.app.overlay = None;
+                    if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter) {
+                        self.discard_now();
                     }
                 }
                 Overlay::Sessions { cursor } => match key.code {
@@ -1197,20 +2088,94 @@ impl Loop {
                     _ if ctrl_c => self.request_quit(),
                     _ => {}
                 },
+                Overlay::Settings { cursor, .. } => match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char(',') => {
+                        self.app.overlay = None
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => self.settings_move(cursor + 1),
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.settings_move(cursor.saturating_sub(1))
+                    }
+                    KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter | KeyCode::Char(' ') => {
+                        self.settings_cycle(cursor, 1)
+                    }
+                    KeyCode::Left | KeyCode::Char('h') => self.settings_cycle(cursor, -1),
+                    KeyCode::Char(c @ '1'..='4') => {
+                        let n = c as usize - '1' as usize;
+                        self.settings_move(settings::first_row_of(Feature::ALL[n]))
+                    }
+                    KeyCode::Char('R') => {
+                        self.app.overlay = Some(Overlay::ConfirmReset { cursor })
+                    }
+                    _ if ctrl_c => self.request_quit(),
+                    _ => {}
+                },
+                Overlay::ConfirmReset { cursor } => {
+                    if matches!(
+                        key.code,
+                        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter
+                    ) {
+                        self.reset_settings(cursor);
+                    } else {
+                        self.app.overlay = Some(Overlay::Settings {
+                            cursor,
+                            notice: None,
+                        });
+                    }
+                }
                 Overlay::Help => self.app.overlay = None,
             }
             self.app.dirty = true;
             return;
         }
+        // The session bar has the keys: h/l (and ←/→) walk the sessions, Enter and Esc
+        // hand the keys back to the panes; a key meant for a pane goes there and takes the
+        // focus with it.
+        if self.app.bar_focused {
+            match key.code {
+                KeyCode::Char('h') => {
+                    self.step_session(-1);
+                    return;
+                }
+                KeyCode::Char('l') => {
+                    self.step_session(1);
+                    return;
+                }
+                KeyCode::Enter | KeyCode::Esc => {
+                    self.app.leave_bar();
+                    return;
+                }
+                KeyCode::Char('j') | KeyCode::Down | KeyCode::Char('k') | KeyCode::Up => {
+                    self.app.leave_bar();
+                }
+                _ => {}
+            }
+        }
         match key.code {
             KeyCode::Esc if self.app.session.is_some() => self.view_session(0),
             KeyCode::Char('q') | KeyCode::Esc => self.request_quit(),
             KeyCode::Char('c') if ctrl_c => self.request_quit(),
-            KeyCode::Char('j') | KeyCode::Down => self.app.select_next(),
-            KeyCode::Char('k') | KeyCode::Up => self.app.select_prev(),
+            KeyCode::Char('j') | KeyCode::Down => match self.app.right_pane {
+                RightPane::Related => self.app.chunk_next(),
+                RightPane::Items => self.app.select_next(),
+                RightPane::Summary => self.app.summary_scroll += 1,
+                RightPane::Ask => {}
+            },
+            KeyCode::Char('k') | KeyCode::Up => match self.app.right_pane {
+                RightPane::Related => self.app.chunk_prev(),
+                RightPane::Items => self.app.select_prev(),
+                RightPane::Summary => {
+                    self.app.summary_scroll = self.app.summary_scroll.saturating_sub(1)
+                }
+                RightPane::Ask => {}
+            },
+            KeyCode::Char('m') => self.app.show_summary(),
             KeyCode::Enter => self.run_selected(),
+            KeyCode::Char('r') => self.start_recording(),
             KeyCode::Char('x') => self.confirm_end(),
+            KeyCode::Char('D') => self.confirm_discard(),
             KeyCode::Tab => self.app.toggle_pane(),
+            KeyCode::BackTab => self.app.toggle_pane_back(),
             KeyCode::Char('X') => self.confirm_stop_selected(),
             KeyCode::Char('d') => {
                 if let Some(id) = self.app.dismiss_selected() {
@@ -1221,8 +2186,8 @@ impl Loop {
             KeyCode::Char('o') => self.open_selected(),
             KeyCode::Char('a') => self.ask(),
             KeyCode::Char('S') => self.open_sessions(),
-            KeyCode::Left => self.step_session(1),
-            KeyCode::Right => self.step_session(-1),
+            KeyCode::Left => self.step_session(-1),
+            KeyCode::Right => self.step_session(1),
             KeyCode::Char('i') | KeyCode::Char('n') => {
                 self.app.overlay = Some(Overlay::Note {
                     input: String::new(),
@@ -1240,51 +2205,56 @@ impl Loop {
                 } else if self.app.session.is_some() {
                     self.app
                         .flash("Esc back to the live meeting first".into(), true);
-                } else if self.app.wrap_up == WrapUp::Writing {
+                } else if self.app.rec == RecState::Idle {
                     self.app
-                        .flash("the action items are being written".into(), true);
+                        .flash("nothing recorded yet — r starts the recording".into(), true);
+                } else if self.app.wrap_up == WrapUp::Writing {
+                    self.app.flash(
+                        "the summary and action items are being written — m shows the progress".into(),
+                        true,
+                    );
                 } else if self.app.suggest_disabled {
                     self.app
                         .flash("suggestions are off (--no-suggest)".into(), true);
                 } else {
                     self.app.wrap_up = WrapUp::NotYet;
                     self.app
-                        .flash("writing the action items again…".into(), false);
+                        .flash("writing the summary and action items again…".into(), false);
                     self.wrap_up();
                 }
             }
             KeyCode::Char(' ') => {
-                if self.app.is_live() {
-                    self.recorder.toggle_pause();
+                if let Some(r) = self.recorder.as_ref().filter(|_| self.app.is_live()) {
+                    r.toggle_pause();
                 }
             }
-            KeyCode::PageUp | KeyCode::Char('K') => {
-                let cur = self.app.transcript_scroll.unwrap_or(usize::MAX / 2);
-                self.app.transcript_scroll = Some(cur.saturating_sub(10));
+            KeyCode::Char('M') => self.toggle_mute("mic"),
+            KeyCode::Char('N') => self.toggle_mute("system"),
+            KeyCode::PageUp | KeyCode::Char('K') => self.app.scroll_transcript(-10),
+            KeyCode::PageDown | KeyCode::Char('J') => self.app.scroll_transcript(10),
+            KeyCode::Char('G') => {
+                self.app.transcript_scroll = None;
+                self.app.follow_chunks();
             }
-            KeyCode::PageDown | KeyCode::Char('J') => {
-                if let Some(s) = self.app.transcript_scroll {
-                    self.app.transcript_scroll = Some(s + 10);
-                }
-            }
-            KeyCode::Char('G') => self.app.transcript_scroll = None,
             KeyCode::Char('[') => match self.app.right_pane {
                 RightPane::Items => {
                     self.app.detail_scroll = self.app.detail_scroll.saturating_sub(3)
                 }
                 RightPane::Related => {
-                    let cur = self.app.related_scroll.unwrap_or(usize::MAX / 2);
-                    self.app.related_scroll = Some(cur.saturating_sub(3));
+                    self.app.related_scroll = self.app.related_scroll.saturating_sub(3)
                 }
+                RightPane::Summary => {
+                    self.app.summary_scroll = self.app.summary_scroll.saturating_sub(3)
+                }
+                RightPane::Ask => {}
             },
             KeyCode::Char(']') => match self.app.right_pane {
                 RightPane::Items => self.app.detail_scroll += 3,
-                RightPane::Related => {
-                    if let Some(s) = self.app.related_scroll {
-                        self.app.related_scroll = Some(s + 3);
-                    }
-                }
+                RightPane::Related => self.app.related_scroll += 3,
+                RightPane::Summary => self.app.summary_scroll += 3,
+                RightPane::Ask => {}
             },
+            KeyCode::Char(',') => self.open_settings(),
             KeyCode::Char('?') => self.app.overlay = Some(Overlay::Help),
             _ => {}
         }
@@ -1306,8 +2276,13 @@ fn read_tail(path: &str, max_lines: usize) -> Vec<String> {
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     crossterm::terminal::enable_raw_mode().context("enable raw mode")?;
     let mut stdout = std::io::stdout();
-    crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen)
-        .context("enter the alternate screen")?;
+    // The mouse too: a click on the header's `mic` / `system` mutes that source.
+    crossterm::execute!(
+        stdout,
+        crossterm::terminal::EnterAlternateScreen,
+        crossterm::event::EnableMouseCapture
+    )
+    .context("enter the alternate screen")?;
     let backend = CrosstermBackend::new(stdout);
     let terminal = Terminal::new(backend)?;
     // A panic must not leave the terminal raw.
@@ -1321,5 +2296,11 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
 
 fn restore_terminal() {
     let _ = crossterm::terminal::disable_raw_mode();
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        // The pointer back to an arrow, should meet leave mid-hover.
+        crossterm::style::Print("\x1b]22;default\x1b\\"),
+        crossterm::event::DisableMouseCapture,
+        crossterm::terminal::LeaveAlternateScreen
+    );
 }

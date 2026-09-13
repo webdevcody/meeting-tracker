@@ -24,7 +24,12 @@ struct Segment: Codable, Sendable {
 /// Single owner of session state and the only writer to stdout.
 actor Session {
     private(set) var paused = false
+    /// Sources whose audio is currently replaced with silence (see `Recorder.setMuted`).
+    private(set) var muted: Set<Source> = []
     private(set) var stopped = false
+    /// The stop was a discard (`D`): nothing is written, no hook runs, the meeting
+    /// directory is deleted.
+    private(set) var discarded = false
     private(set) var segments: [Segment] = []
     private var counts: [Source: Int] = [:]
     private var startedAt: Date?
@@ -71,8 +76,23 @@ actor Session {
         return paused
     }
 
-    func requestStop() {
+    /// Flips the mute of `source` and returns its new state; nil (and a note) when that
+    /// source is not part of this recording.
+    func toggleMute(_ source: Source) -> Bool? {
+        guard sources.contains(source) else {
+            log("ℹ \(source.label.lowercased()) is not being recorded here — nothing to mute")
+            return nil
+        }
+        let m = !muted.contains(source)
+        if m { muted.insert(source) } else { muted.remove(source) }
+        Events.emit("muted", ["source": source.rawValue, "muted": m, "elapsed": elapsed])
+        draw()
+        return m
+    }
+
+    func requestStop(discard: Bool = false) {
         guard !stopped else { return }
+        discarded = discard
         let now = Date()
         if paused, let ps = pauseStart {
             pausedAccum += now.timeIntervalSince(ps)
@@ -118,8 +138,11 @@ actor Session {
             line = statusText
         } else {
             let state = paused ? "⏸ PAUSED" : "● REC"
-            let tracks = sources.map { "\($0.rawValue) \(counts[$0, default: 0])" }.joined(separator: " · ")
-            line = "\(state) \(Self.format(elapsed)) │ \(tracks) │ \(Diagnostics.residentMB()) MB │ [space] pause  [q] stop"
+            let tracks = sources.map { s in
+                "\(muted.contains(s) ? "⊘ " : "")\(s.rawValue) \(counts[s, default: 0])"
+            }.joined(separator: " · ")
+            let mute = sources.map { $0 == .mic ? "[m] mute mic" : "[n] mute system" }.joined(separator: "  ")
+            line = "\(state) \(Self.format(elapsed)) │ \(tracks) │ \(Diagnostics.residentMB()) MB │ [space] pause  \(mute)  [q] stop  [D] discard"
         }
         print("\r\u{1B}[2K\(line)", terminator: "")
         fflush(stdout)

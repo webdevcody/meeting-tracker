@@ -23,7 +23,10 @@ struct Record: AsyncParsableCommand {
         commandName: "record",
         abstract: "Record a meeting (default when no subcommand is given).",
         discussion: """
-        Keys while recording: [space] pause/resume, [q]/[enter]/ctrl-c stop.
+        Keys while recording: [space] pause/resume, [m] mute/unmute the microphone, [n]
+        mute/unmute the system audio (a muted source is recorded and transcribed as
+        silence), [q]/[enter]/ctrl-c stop, [D] discard (stop and delete the recording: no
+        transcript, no audio, no hooks).
 
         Config file (first found wins): --config, $MEET_CONFIG, meet.json in the current
         directory or nearest parent, ~/.config/meet/config.json. CLI flags override the
@@ -199,8 +202,15 @@ struct Record: AsyncParsableCommand {
                 case 0x20:
                     let paused = await session.togglePause()
                     recorder.setPaused(paused)
+                case UInt8(ascii: "m"), UInt8(ascii: "M"):
+                    if let m = await session.toggleMute(.mic) { recorder.setMuted(.mic, m) }
+                case UInt8(ascii: "n"), UInt8(ascii: "N"):
+                    if let m = await session.toggleMute(.system) { recorder.setMuted(.system, m) }
                 case UInt8(ascii: "q"), UInt8(ascii: "Q"), 0x0A, 0x0D, 0x03, 0x04:
                     await session.requestStop()
+                    return
+                case UInt8(ascii: "D"):
+                    await session.requestStop(discard: true)
                     return
                 default:
                     break
@@ -272,6 +282,29 @@ struct Record: AsyncParsableCommand {
         durationTask?.cancel()
         keysTask.cancel()
 
+        // A discard: stop capture, drop the transcribers without draining them, delete
+        // the meeting directory (a checkpoint may have written a transcript into it) and
+        // leave — no output, no hooks.
+        if await session.discarded {
+            // Let a transcript checkpoint that is mid-write finish before the directory goes.
+            _ = await tickerTask.value
+            recorder.stop()
+            for t in transcribers { await t.cancel() }
+            Terminal.restore()
+            let elapsed = await session.elapsed
+            let segCount = await session.segmentCount
+            do {
+                try FileManager.default.removeItem(at: meetingDir)
+                note("Discarded \(meetingDir.path) — \(Output.humanDuration(elapsed)), \(segCount) segment(s); nothing kept, no hooks run")
+            } catch {
+                log("⚠ could not delete \(meetingDir.path): \(error)")
+            }
+            Events.emit("discarded", ["meetingDir": meetingDir.path,
+                                      "durationSecs": elapsed,
+                                      "segmentCount": segCount])
+            Darwin.exit(0)
+        }
+
         // Stop capture, drain transcribers
         recorder.stop()
         let endedAt = Date()
@@ -338,6 +371,10 @@ struct Record: AsyncParsableCommand {
                                  "transcriptPath": output.transcriptMD.path,
                                  "transcriptJsonPath": output.transcriptJSON.path,
                                  "audioPath": mergedAudio?.path ?? ""])
+        // How many onDone hooks follow (0 with none configured or --no-hooks), so a
+        // consumer knows whether to expect `hook` events before the process exits.
+        Events.emit("hooks", ["count": noHooks ? 0 : cfg.hooks.onDone.count,
+                              "skipped": noHooks && !cfg.hooks.onDone.isEmpty])
 
         if !noHooks, !cfg.hooks.onDone.isEmpty {
             let iso = ISO8601DateFormatter()

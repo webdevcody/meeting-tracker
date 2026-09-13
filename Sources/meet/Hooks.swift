@@ -2,15 +2,23 @@ import Foundation
 
 enum Hooks {
     /// Runs each command sequentially via `/bin/sh -c`, with MT_* env vars set and the
-    /// transcript text on stdin. Failures are logged and the next hook still runs.
+    /// transcript text on stdin. Failures are logged and the next hook still runs. In
+    /// `--json` mode each hook is bracketed by a `hook` event (`phase` `start` / `end`,
+    /// with its 1-based `index`, the `count`, the `command`, and at the end its exit
+    /// `status` and the `secs` it took), so the TUI can show the hook that is running —
+    /// the bundled one calls Claude to summarize the transcript — and how it ended.
     static func run(_ commands: [String], env extra: [String: String], cwd: URL, stdin text: String) async {
         Terminal.restore()
         for (i, command) in commands.enumerated() {
             note("→ hook[\(i + 1)]: \(command)")
+            Events.emit("hook", ["index": i + 1, "count": commands.count, "command": command, "phase": "start"])
+            let started = Date()
             let status = await runOne(command, env: extra, cwd: cwd, stdin: text)
             if status != 0 {
                 log("⚠ hook[\(i + 1)] exited \(status)")
             }
+            Events.emit("hook", ["index": i + 1, "count": commands.count, "command": command, "phase": "end",
+                                 "status": Int(status), "secs": Date().timeIntervalSince(started)])
         }
     }
 

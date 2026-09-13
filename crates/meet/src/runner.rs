@@ -9,6 +9,7 @@
 //! reached the publish phase only redoes the tail. See [`plan_for`].
 
 use crate::claude::{spawn_agent, AgentEvent, AgentSpawn};
+use crate::stream_json::Usage;
 use crate::store::{ActionItem, ItemStatus, RunOutcome, RunPhase};
 use crate::{branch_name, config, git, hook, pr_body};
 use anyhow::{bail, Context, Result};
@@ -23,6 +24,8 @@ pub struct RunContext {
     pub claude_bin: String,
     pub gh_bin: String,
     pub agent_model: Option<String>,
+    /// The agent's `--effort` (`None`: claude's own).
+    pub agent_effort: Option<String>,
     /// The chunk summary the item came from, for the agent's context.
     pub meeting_context: String,
     /// The on-done prompt template (`agent.onDone` in meet.json, `--on-done`), delivered
@@ -54,6 +57,15 @@ pub enum RunEvent {
     Activity {
         item_id: String,
         text: String,
+    },
+    /// What the agent spent. While it works, one API turn at a time (`ended: false`);
+    /// when its process ends (`ended: true`), the whole run's usage, which replaces the
+    /// turns' tally — or `None` when it died before reporting one, in which case the
+    /// tally stands.
+    Usage {
+        item_id: String,
+        usage: Option<Usage>,
+        ended: bool,
     },
     Finished {
         item_id: String,
@@ -382,6 +394,7 @@ async fn run(
                 cwd: &worktree,
                 prompt: prompt.clone(),
                 model: ctx.agent_model.as_deref(),
+                effort: ctx.agent_effort.as_deref(),
                 run_dir,
                 resume: session.as_deref(),
                 settings: settings.as_deref(),
@@ -406,13 +419,26 @@ async fn run(
                         text,
                     });
                 }
+                AgentEvent::Usage(usage) => {
+                    let _ = tx.send(RunEvent::Usage {
+                        item_id: item.id.clone(),
+                        usage: Some(usage),
+                        ended: false,
+                    });
+                }
                 AgentEvent::Ended {
                     is_error,
                     stopped,
                     saw_init,
                     text,
+                    usage,
                     ..
                 } => {
+                    let _ = tx.send(RunEvent::Usage {
+                        item_id: item.id.clone(),
+                        usage,
+                        ended: true,
+                    });
                     ended = Some((is_error, stopped, saw_init, text));
                     break;
                 }
@@ -581,6 +607,7 @@ mod tests {
             claude_bin: "claude".into(),
             gh_bin: "gh".into(),
             agent_model: None,
+            agent_effort: None,
             meeting_context: "we talked about json".into(),
             on_done: None,
             exe: "/usr/local/bin/meet".into(),

@@ -7,7 +7,7 @@
 //! `meet` took down with it — or that the user stopped — is picked up later with
 //! `claude --resume <session id>` in the same worktree, conversation intact.
 
-use crate::stream_json::{parse_line, StreamItem};
+use crate::stream_json::{parse_value, result_usage, turn_usage, StreamItem, Usage};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
 use std::path::Path;
@@ -47,7 +47,38 @@ pub struct Structured<'a> {
     pub max_budget_usd: f64,
 }
 
-pub async fn structured(req: Structured<'_>) -> Result<Value> {
+/// What a one-shot call came back with: the answer, and what it spent. The spend is
+/// counted even when the answer is unusable (a schema mismatch, a budget error): the
+/// tokens went either way. Zero when claude never printed its envelope.
+pub struct Answer {
+    pub usage: Usage,
+    pub value: Result<Value>,
+}
+
+pub async fn structured(req: Structured<'_>) -> Answer {
+    let stdout = match run_structured(req).await {
+        Ok(s) => s,
+        Err(e) => {
+            return Answer {
+                usage: Usage::default(),
+                value: Err(e),
+            }
+        }
+    };
+    let env = envelope(&stdout);
+    let usage = env
+        .as_ref()
+        .ok()
+        .and_then(result_usage)
+        .unwrap_or_default();
+    let value = env
+        .and_then(|e| structured_of(&e))
+        .with_context(|| format!("claude output: {}", excerpt(&stdout, 300)));
+    Answer { usage, value }
+}
+
+/// Runs the call; claude's stdout, once it exited.
+async fn run_structured(req: Structured<'_>) -> Result<String> {
     let mut cmd = command(req.bin, req.cwd);
     cmd.args([
         "-p",
@@ -90,18 +121,27 @@ pub async fn structured(req: Structured<'_>) -> Result<Value> {
     if !output.status.success() && stdout.trim().is_empty() {
         bail!("claude exited {}: {}", output.status, stderr.trim());
     }
-    parse_structured(&stdout).with_context(|| format!("claude output: {}", excerpt(&stdout, 300)))
+    Ok(stdout.into_owned())
 }
 
 /// `structured_output` when the schema was honoured; otherwise the JSON object inside the
 /// `result` text (some runs answer in prose with a fenced block).
+#[cfg(test)]
 pub fn parse_structured(stdout: &str) -> Result<Value> {
-    // A rate-limit notice or a stray log line can precede the JSON envelope.
-    let envelope: Value = stdout
+    structured_of(&envelope(stdout)?)
+}
+
+/// The `result` envelope in claude's stdout. A rate-limit notice or a stray log line can
+/// precede it.
+fn envelope(stdout: &str) -> Result<Value> {
+    stdout
         .lines()
         .rev()
         .find_map(|l| serde_json::from_str::<Value>(l.trim()).ok())
-        .ok_or_else(|| anyhow!("no JSON envelope in claude's output"))?;
+        .ok_or_else(|| anyhow!("no JSON envelope in claude's output"))
+}
+
+fn structured_of(envelope: &Value) -> Result<Value> {
     if envelope.get("is_error").and_then(Value::as_bool) == Some(true) {
         bail!(
             "claude reported an error: {}",
@@ -148,6 +188,9 @@ pub enum AgentEvent {
     Session(String),
     /// A one-line description of what it is doing now.
     Activity(String),
+    /// One API turn's tokens, as the agent works (its output count is a placeholder
+    /// until the run ends; see `stream_json::turn_usage`).
+    Usage(Usage),
     /// The process ended. `text` is the final assistant message.
     Ended {
         is_error: bool,
@@ -157,7 +200,9 @@ pub enum AgentEvent {
         /// this is one whose session Claude no longer has.
         saw_init: bool,
         text: String,
-        cost_usd: Option<f64>,
+        /// The whole run's tokens and cost, when it got as far as reporting them; it
+        /// supersedes the turns relayed as `Usage`.
+        usage: Option<Usage>,
         exit_code: Option<i32>,
     },
 }
@@ -168,6 +213,8 @@ pub struct AgentSpawn<'a> {
     pub cwd: &'a Path,
     pub prompt: String,
     pub model: Option<&'a str>,
+    /// `--effort`: how hard the agent thinks (`None`: claude's own).
+    pub effort: Option<&'a str>,
     /// `<run_dir>/stream.jsonl` (raw) and `<run_dir>/agent.log` (readable) are appended to.
     pub run_dir: &'a Path,
     /// `claude --resume <id>`: carry an earlier conversation on instead of starting one.
@@ -205,6 +252,9 @@ pub fn spawn_agent(
     }
     if let Some(m) = spec.model {
         cmd.args(["--model", m]);
+    }
+    if let Some(e) = spec.effort {
+        cmd.args(["--effort", e]);
     }
     if let Some(s) = spec.settings {
         cmd.arg("--settings");
@@ -248,9 +298,11 @@ pub fn spawn_agent(
     });
     Ok(tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
-        let mut ended: Option<(bool, String, Option<f64>)> = None;
+        let mut ended: Option<(bool, String, Option<Usage>)> = None;
         let mut saw_init = false;
         let mut stopped = false;
+        // The API turn last counted: its lines share one message id.
+        let mut last_turn: Option<String> = None;
         // Once the sender is gone or the stop is done there is nothing left to watch.
         let mut watch_stop = true;
         loop {
@@ -274,7 +326,16 @@ pub fn spawn_agent(
                 }
             };
             let _ = writeln!(raw, "{line}");
-            let Some(item) = parse_line(&line) else {
+            let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
+                continue;
+            };
+            if let Some((id, usage)) = turn_usage(&value) {
+                if last_turn.as_deref() != Some(id.as_str()) {
+                    last_turn = Some(id);
+                    let _ = tx.send(AgentEvent::Usage(usage));
+                }
+            }
+            let Some(item) = parse_value(&value) else {
                 continue;
             };
             let (activity, log_line) = match &item {
@@ -315,8 +376,9 @@ pub fn spawn_agent(
                     text,
                     cost_usd,
                     duration_ms,
+                    usage,
                 } => {
-                    ended = Some((*is_error, text.clone(), *cost_usd));
+                    ended = Some((*is_error, text.clone(), *usage));
                     let cost = cost_usd.map(|c| format!(" · ${c:.2}")).unwrap_or_default();
                     let secs = duration_ms
                         .map(|d| format!(" · {}s", d / 1000))
@@ -347,7 +409,7 @@ pub fn spawn_agent(
         if !stderr.trim().is_empty() {
             let _ = writeln!(log, "── stderr\n{}", stderr.trim());
         }
-        let (is_error, text, cost_usd) = match ended {
+        let (is_error, text, usage) = match ended {
             Some(e) => e,
             None if stopped => (true, "stopped by the user".to_string(), None),
             None => (
@@ -365,7 +427,7 @@ pub fn spawn_agent(
             stopped,
             saw_init,
             text,
-            cost_usd,
+            usage,
             exit_code,
         });
     }))
@@ -407,6 +469,115 @@ mod tests {
         assert!(parse_structured("").is_err());
     }
 
+    /// A stand-in that answers the schema with an envelope carrying `usage`: the answer
+    /// and the spend both come back. With `is_error`, the spend still does.
+    #[tokio::test]
+    async fn a_structured_call_reports_what_it_spent_even_when_the_answer_is_unusable() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("claude");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nif [ \"$(cat)\" = err ]; then\necho '{\"type\":\"result\",\"is_error\":true,\"result\":\"over budget\",\"total_cost_usd\":0.5,\"usage\":{\"input_tokens\":7,\"output_tokens\":3}}'\nelse\necho '{\"type\":\"result\",\"is_error\":false,\"result\":\"ok\",\"structured_output\":{\"a\":1},\"total_cost_usd\":0.25,\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":20,\"cache_read_input_tokens\":30,\"output_tokens\":4}}'\nfi\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let req = |prompt: &'static str| Structured {
+            bin: fake.to_str().unwrap(),
+            cwd: dir.path(),
+            model: None,
+            effort: None,
+            system_prompt: "s",
+            prompt,
+            schema: "{}",
+            tools: &[],
+            max_budget_usd: 1.0,
+        };
+        let ans = structured(req("p")).await;
+        assert_eq!(ans.value.unwrap()["a"], 1);
+        assert_eq!(
+            ans.usage,
+            Usage {
+                input: 10,
+                cache_write: 20,
+                cache_read: 30,
+                output: 4,
+                cost_usd: 0.25
+            }
+        );
+        let ans = structured(req("err")).await;
+        assert!(ans.value.unwrap_err().to_string().contains("over budget"));
+        assert_eq!(ans.usage.input, 7);
+        assert_eq!(ans.usage.cost_usd, 0.5);
+        let ans = structured(Structured {
+            bin: "/nonexistent/claude",
+            ..req("p")
+        })
+        .await;
+        assert!(ans.value.is_err());
+        assert!(ans.usage.is_zero());
+    }
+
+    /// An agent whose one API turn streams as two lines (thinking, then text) with the
+    /// same message id: the turn is relayed once, and the result's usage ends the run.
+    #[tokio::test]
+    async fn an_agent_relays_each_turn_once_and_the_final_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("claude");
+        std::fs::write(
+            &fake,
+            concat!(
+                "#!/bin/sh\ncat >/dev/null\n",
+                "echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"sid-1\"}'\n",
+                "echo '{\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"hm\"}],\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":100,\"output_tokens\":1}}}'\n",
+                "echo '{\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"content\":[{\"type\":\"text\",\"text\":\"done\"}],\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":100,\"output_tokens\":1}}}'\n",
+                "echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\",\"total_cost_usd\":0.05,\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":100,\"output_tokens\":40}}'\n",
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let run_dir = dir.path().join("run");
+        let task = spawn_agent(
+            AgentSpawn {
+                bin: fake.to_str().unwrap(),
+                cwd: dir.path(),
+                prompt: "hi".into(),
+                model: None,
+                effort: None,
+                run_dir: &run_dir,
+                resume: None,
+                settings: None,
+                env: Vec::new(),
+            },
+            stop_rx,
+            tx,
+        )
+        .unwrap();
+        let mut turns = Vec::new();
+        let mut ended = None;
+        while let Some(ev) = rx.recv().await {
+            match ev {
+                AgentEvent::Usage(u) => turns.push(u),
+                AgentEvent::Ended { usage, is_error, .. } => {
+                    ended = Some((usage, is_error));
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let _ = task.await;
+        assert_eq!(turns.len(), 1, "{turns:?}");
+        assert_eq!(turns[0].input_total(), 110);
+        let (usage, is_error) = ended.unwrap();
+        assert!(!is_error);
+        let usage = usage.unwrap();
+        assert_eq!(usage.output, 40);
+        assert_eq!(usage.cost_usd, 0.05);
+    }
+
     /// A stand-in for `claude` that prints an init line, then sleeps: stopping it must
     /// end the task with `stopped`, and the session id must have been relayed first.
     #[tokio::test]
@@ -429,6 +600,7 @@ mod tests {
                 cwd: dir.path(),
                 prompt: "hi".into(),
                 model: None,
+                effort: None,
                 run_dir: &run_dir,
                 resume: Some("sid-9"),
                 settings: None,
