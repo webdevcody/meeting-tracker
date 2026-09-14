@@ -21,6 +21,8 @@ use tokio::sync::mpsc;
 const SCROLLBACK: usize = 2000;
 /// DA1 answer: "I am a VT102", the reply terminal-detection loops wait for.
 const DA1_REPLY: &[u8] = b"\x1b[?6c";
+/// How long a hung-up session gets before whatever is left of it is SIGKILLed.
+const KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Debug, PartialEq)]
 pub enum TermEvent {
@@ -43,6 +45,8 @@ pub struct Term {
     writer: Box<dyn Write + Send>,
     master: Box<dyn MasterPty + Send>,
     killer: Box<dyn ChildKiller + Send + Sync>,
+    /// The child's pid: the login shell, which leads the pseudo-terminal's session.
+    pid: Option<u32>,
     /// The last bytes of the previous output chunk, so a DA1 query split across two reads
     /// is still seen.
     tail: Vec<u8>,
@@ -81,6 +85,7 @@ impl Term {
             .with_context(|| format!("start {}", spec.program))?;
         drop(pair.slave);
         let killer = child.clone_killer();
+        let pid = child.process_id();
         let mut reader = pair.master.try_clone_reader().context("pty reader")?;
         let writer = pair.master.take_writer().context("pty writer")?;
         std::thread::spawn(move || {
@@ -103,6 +108,7 @@ impl Term {
             writer,
             master: pair.master,
             killer,
+            pid,
             tail: Vec::new(),
             exited: false,
             exit_code: None,
@@ -167,10 +173,36 @@ impl Term {
         self.exit_code = code;
     }
 
+    /// Hang the session up: SIGHUP to every process group under the child, then SIGKILL
+    /// whatever still stands after [`KILL_GRACE`]. The child is the user's login shell (see
+    /// [`crate::shell`]); when it runs `claude` as a job, that job has a process group of
+    /// its own on the pseudo-terminal, which a signal to the shell alone would leave running
+    /// with its pane gone. The hangups go out before this returns, so they land even when
+    /// meet exits right after (on quit); the escalation runs on a thread that dies with meet.
     pub fn kill(&mut self) {
-        if !self.exited {
-            let _ = self.killer.kill();
+        if self.exited {
+            return;
         }
+        // Taken before the hangup: a shell that dies of it leaves its job to init, where no
+        // walk from its pid would find it afterwards.
+        let groups = self
+            .pid
+            .map(crate::shell::process_groups_under)
+            .unwrap_or_default();
+        let _ = self.killer.kill();
+        crate::shell::signal_groups(&groups, libc::SIGHUP);
+        if groups.is_empty() {
+            return;
+        }
+        std::thread::spawn(move || {
+            let alive = |g: u32| unsafe { libc::killpg(g as i32, 0) } == 0;
+            let deadline = std::time::Instant::now() + KILL_GRACE;
+            while std::time::Instant::now() < deadline && groups.iter().any(|&g| alive(g)) {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            let left: Vec<u32> = groups.into_iter().filter(|&g| alive(g)).collect();
+            crate::shell::signal_groups(&left, libc::SIGKILL);
+        });
     }
 }
 
@@ -333,6 +365,88 @@ pub fn render(screen: &vt100::Screen, area: Rect, buf: &mut Buffer) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pane as the user's work setup reaches it: `claude` is a function in `.zshrc`,
+    /// started through the login shell on the pseudo-terminal. The function runs (its
+    /// output reaches the screen), and a kill ends the process it started, not just the
+    /// shell. Skipped where there is no zsh.
+    #[test]
+    fn a_zshrc_claude_function_runs_in_the_pane_and_a_kill_ends_it() {
+        if std::process::Command::new("zsh")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let pidfile = home.path().join("job.pid");
+        std::fs::write(
+            home.path().join(".zshrc"),
+            "claude() { echo \"routed $*\"; sh -c 'echo $$ > \"$MEET_TEST_PIDFILE\"; exec sleep 30'; }\n",
+        )
+        .unwrap();
+        let (program, args) = crate::shell::login_shell_wrap(
+            "zsh",
+            "claude",
+            &["--name".to_string(), "meet · questions".to_string()],
+        );
+        let env = vec![
+            ("ZDOTDIR".to_string(), home.path().to_string_lossy().into_owned()),
+            (
+                "MEET_TEST_PIDFILE".to_string(),
+                pidfile.to_string_lossy().into_owned(),
+            ),
+        ];
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut term = Term::spawn(
+            Spawn {
+                program: &program,
+                args: &args,
+                cwd: home.path(),
+                env: &env,
+                cols: 80,
+                rows: 24,
+            },
+            tx,
+        )
+        .unwrap();
+        const ROUTED: &str = "routed --name meet · questions";
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut job: Option<i32> = None;
+        while std::time::Instant::now() < deadline {
+            while let Ok(ev) = rx.try_recv() {
+                if let TermEvent::Output(bytes) = ev {
+                    term.process(&bytes);
+                }
+            }
+            job = job.or_else(|| {
+                std::fs::read_to_string(&pidfile)
+                    .ok()
+                    .and_then(|s| s.trim().parse().ok())
+            });
+            if job.is_some() && term.screen().contents().contains(ROUTED) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let job = job.expect("the claude function started its process");
+        let screen = term.screen().contents();
+        assert!(screen.contains(ROUTED), "screen: {screen}");
+        term.kill();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let alive = |pid: i32| unsafe { libc::kill(pid, 0) } == 0;
+        while alive(job) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let still = alive(job);
+        if still {
+            unsafe {
+                libc::kill(job, libc::SIGKILL);
+            }
+        }
+        assert!(!still, "the claude function's process outlived the kill");
+    }
 
     fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, mods)

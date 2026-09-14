@@ -20,7 +20,9 @@ use crate::term::Term;
 use crate::layout::{
     self, HitMap, LayoutPrefs, PointerShape, Splitter, SplitterDrag,
 };
+use crate::selection::{self, TextRow, TextSelection};
 use crate::theme::Theme;
+use ratatui::layout::Position;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -263,6 +265,15 @@ pub struct App {
     pub hover_splitter: Option<Splitter>,
     /// The pointer shape the terminal should show; the event loop sends it when it changes.
     pub pointer_shape: PointerShape,
+    /// Transcript text dragged over or double-clicked (`selection`): highlighted, and
+    /// already copied, until the next click lets it go.
+    pub transcript_sel: Option<TextSelection>,
+    /// The last press on the transcript, for telling a double-click.
+    last_transcript_press: Option<(Instant, (usize, usize))>,
+    /// The first transcript row the last frame showed.
+    pub transcript_top: usize,
+    /// A copy for the terminal to put on its clipboard (OSC 52); the event loop sends it.
+    pub pending_clipboard: Option<String>,
 }
 
 pub const FLASH_FOR: Duration = Duration::from_secs(6);
@@ -355,6 +366,10 @@ impl App {
             splitter_drag: None,
             hover_splitter: None,
             pointer_shape: PointerShape::Default,
+            transcript_sel: None,
+            last_transcript_press: None,
+            transcript_top: 0,
+            pending_clipboard: None,
         }
     }
 
@@ -471,6 +486,99 @@ impl App {
         had
     }
 
+    /// The transcript row and cell under `(x, y)`, pulled into the text area — a drag past
+    /// an edge stays on that edge's row. `None` while the transcript has no text area.
+    fn transcript_cell(&self, x: u16, y: u16) -> Option<(usize, usize)> {
+        let r = self.hit.transcript_text;
+        if r.width == 0 || r.height == 0 {
+            return None;
+        }
+        let col = x.clamp(r.x, r.right() - 1) - r.x;
+        let row = y.clamp(r.y, r.bottom() - 1) - r.y;
+        Some((usize::from(col), self.transcript_top + usize::from(row)))
+    }
+
+    /// The shown transcript wrapped to `width`, row for row as its pane draws it.
+    fn transcript_rows(&self, width: usize) -> Vec<TextRow> {
+        crate::ui::transcript_rows(self.shown_transcript(), width)
+    }
+
+    /// A press on the transcript's text: the second on one cell selects the word under it
+    /// and hands it back to copy; any other press arms a drag. (The press itself already let
+    /// the last selection go.)
+    pub fn press_transcript(&mut self, x: u16, y: u16) -> Option<String> {
+        let r = self.hit.transcript_text;
+        if !r.contains(Position::new(x, y)) {
+            return None;
+        }
+        let cell = self.transcript_cell(x, y)?;
+        let width = usize::from(r.width);
+        self.dirty = true;
+        if selection::is_double_click(&mut self.last_transcript_press, cell) {
+            let rows = self.transcript_rows(width);
+            if let Some((first, last)) = selection::word_at(&rows, cell.0, cell.1) {
+                let sel = TextSelection {
+                    anchor: (first, cell.1),
+                    head: (last, cell.1),
+                    width,
+                    dragging: false,
+                    active: true,
+                };
+                self.transcript_sel = Some(sel);
+                return Some(selection::selected_text(&rows, &sel));
+            }
+        }
+        self.transcript_sel = Some(TextSelection::press(cell, width));
+        None
+    }
+
+    /// The pointer moved with the button down on a selection being made: its far end
+    /// follows. Past the top or the bottom of the text the transcript scrolls a row a move,
+    /// so a selection can run longer than the pane. `false` when no selection is being made.
+    pub fn drag_selection_to(&mut self, x: u16, y: u16) -> bool {
+        let Some(mut sel) = self.transcript_sel.filter(|s| s.dragging) else {
+            return false;
+        };
+        let r = self.hit.transcript_text;
+        if r.height == 0 {
+            return true;
+        }
+        if y < r.y && self.transcript_top > 0 {
+            self.transcript_top -= 1;
+            self.transcript_scroll = Some(self.transcript_top);
+        } else if y >= r.bottom() && self.transcript_top < self.transcript_max {
+            self.transcript_top += 1;
+            self.transcript_scroll = Some(self.transcript_top);
+        }
+        if let Some(cell) = self.transcript_cell(x, y) {
+            sel.head = cell;
+            // Off its first cell it is a selection, and stays one if it comes back.
+            sel.active |= sel.head != sel.anchor;
+            self.transcript_sel = Some(sel);
+            self.dirty = true;
+        }
+        true
+    }
+
+    /// The button came up on a selection being made. A drag that never left its cell was a
+    /// click, and goes; a real one stays highlighted, and its text comes back to copy.
+    pub fn release_selection(&mut self) -> Option<String> {
+        let mut sel = self.transcript_sel.filter(|s| s.dragging)?;
+        self.dirty = true;
+        sel.dragging = false;
+        let text = if sel.active {
+            selection::selected_text(&self.transcript_rows(sel.width), &sel)
+        } else {
+            String::new()
+        };
+        if text.is_empty() {
+            self.transcript_sel = None;
+            return None;
+        }
+        self.transcript_sel = Some(sel);
+        Some(text)
+    }
+
     /// The wheel over the right pane: `delta` lines (negative is up).
     pub fn scroll_right_pane(&mut self, delta: i32) {
         let step = |v: &mut usize| {
@@ -549,6 +657,7 @@ impl App {
         self.replay_clock = None;
         self.transcript.clear();
         self.transcript_scroll = None;
+        self.transcript_sel = None;
         self.chunker.reset();
         self.chunks.clear();
         self.chunk_cursor = None;
@@ -1038,6 +1147,7 @@ impl App {
         self.session = Some(view);
         self.term_focused = false;
         self.transcript_scroll = None;
+        self.transcript_sel = None;
         self.related_scroll = 0;
         self.detail_scroll = 0;
         if self.right_pane != RightPane::Ask || self.term().is_none() {
@@ -1053,6 +1163,7 @@ impl App {
         self.session = None;
         self.term_focused = false;
         self.transcript_scroll = None;
+        self.transcript_sel = None;
         self.chunk_cursor = None;
         self.related_scroll = 0;
         self.detail_scroll = 0;

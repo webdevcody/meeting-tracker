@@ -167,6 +167,9 @@ echo "== 4. run a second item, quit while it runs"
 select_runnable || exit 1
 keys Enter
 wait_for "1 agent running" 20 "a second agent is running" || exit 1
+# Quit only once the agent has named its session: that id is what the next launch resumes.
+# claude starts through the login shell (rc files first), so "running" shows well before it.
+wait_for "session +fake-session-" 15 "the running agent's session id is shown" || exit 1
 keys q
 sleep 0.4
 wait_for "Quit\\?" 5 "the quit confirm" || exit 1
@@ -325,8 +328,12 @@ tmux -L $SOCK kill-server 2>/dev/null
 
 echo "== 9. meet ask from a plain shell picks the newest meeting and execs claude"
 MEET_DATA_DIR=$W/data $MEET sessions "$repo" | grep -qE "^    id [0-9a-z]{26}$" && ok "meet sessions prints session ids" || bad "no ids in meet sessions"
-( cd "$repo" && MEET_DATA_DIR=$W/data FAKE_CLAUDE_LOG=$W/claude.log $MEET --claude-bin $E2E/fake-claude ask > "$W/ask.out" 2>&1 </dev/null & echo $! > "$W/ask.pid" )
-sleep 2
+# `meet ask` execs an interactive login shell ($SHELL -l -i -c); started in the background of a
+# terminal it would take that terminal's foreground, so give it a session of its own (perl's
+# setsid: macOS has no setsid(1)). Then wait for the fake's banner, not a fixed pause: the
+# shell reads its rc files before claude starts.
+( cd "$repo" && MEET_DATA_DIR=$W/data FAKE_CLAUDE_LOG=$W/claude.log perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV or die "exec: $!"' $MEET --claude-bin $E2E/fake-claude ask > "$W/ask.out" 2>&1 </dev/null & echo $! > "$W/ask.pid" )
+for i in $(seq 1 30); do grep -q "fake claude · question session" "$W/ask.out" 2>/dev/null && break; sleep 0.5; done
 kill "$(cat "$W/ask.pid")" 2>/dev/null
 grep -q "meet · questions about the meeting of" "$W/ask.out" && ok "meet ask names the meeting it opens" || bad "meet ask output: $(cat "$W/ask.out")"
 grep -q "fake claude · question session · meet · questions" "$W/ask.out" && ok "meet ask exec'd claude with the session name" || bad "claude did not come up: $(cat "$W/ask.out")"

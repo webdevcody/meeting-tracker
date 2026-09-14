@@ -134,7 +134,8 @@ pub fn claude_env(ctx: &AskContext) -> Vec<(String, String)> {
 }
 
 /// `meet ask`: pick the meeting, make sure its files are there, replace this process with
-/// `claude`. `meeting`: an id, else the live meeting in this repo, else the newest one.
+/// `claude` — through the login shell, as `a` and every headless call start it (see
+/// [`crate::shell`]). `meeting`: an id, else the live meeting in this repo, else the newest one.
 pub fn run_cli(
     dir: PathBuf,
     meeting: Option<String>,
@@ -164,8 +165,9 @@ pub fn run_cli(
         if l.ctx.live { "recording now" } else { "ended" }
     );
     eprintln!("transcript: {}", l.ctx.transcript().display());
-    let mut cmd = std::process::Command::new(&l.claude_bin);
-    cmd.args(claude_args(&l))
+    let (program, args) = crate::shell::claude_launch(&l.claude_bin, &claude_args(&l));
+    let mut cmd = std::process::Command::new(&program);
+    cmd.args(args)
         .current_dir(&repo)
         .env_remove("CLAUDECODE")
         .env_remove("CLAUDE_CODE_ENTRYPOINT");
@@ -173,7 +175,7 @@ pub fn run_cli(
         cmd.env(k, v);
     }
     let err = cmd.exec();
-    Err(anyhow::Error::new(err).context(format!("exec {}", l.claude_bin)))
+    Err(anyhow::Error::new(err).context(format!("exec {program} for {}", l.claude_bin)))
 }
 
 /// The meeting `meet ask` is about: by id, else the live one, else the newest.

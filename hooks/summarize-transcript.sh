@@ -13,7 +13,11 @@
 #   MT_SUMMARY_PROMPT         summary.prompt       the instruction sent to Claude
 #   MT_SUMMARY_SYSTEM_PROMPT  summary.systemPrompt text for `claude --append-system-prompt`
 #   MT_SUMMARY_MODEL          summary.model        `claude --model …`
-#   MT_CLAUDE_BIN             summary.claudePath   claude binary (default: `claude` in PATH)
+#   MT_CLAUDE_BIN             summary.claudePath   claude command (default: `claude`)
+#
+# Claude starts the way it would at your terminal prompt: through your login, interactive
+# shell ($SHELL -l -i -c), so ~/.zprofile and ~/.zshrc load and an alias or function named
+# `claude` wins over the binary on PATH — as nebula and meet itself start it.
 #
 # The transcript itself and a short metadata block (date, duration, paths) are always
 # appended after MT_SUMMARY_PROMPT, so the prompt only needs to say what to do with them.
@@ -32,8 +36,29 @@ DEFAULT_SYSTEM_PROMPT="You are running headless as a meet hook; do not ask quest
 PROMPT="${MT_SUMMARY_PROMPT:-$DEFAULT_PROMPT}"
 SYSTEM_PROMPT="${MT_SUMMARY_SYSTEM_PROMPT:-$DEFAULT_SYSTEM_PROMPT}"
 
-if ! command -v "$CLAUDE_BIN" >/dev/null 2>&1; then
-  echo "summarize-transcript: '$CLAUDE_BIN' not found (set summary.claudePath in the config or add it to PATH)" >&2
+# Run "$@" (a command name, then its arguments) in the user's login, interactive shell, so
+# the shell resolves the name the way a typed command is resolved: rc files loaded, alias or
+# function first. perl's setsid keeps that interactive shell off the terminal meet draws on
+# (zsh -i with a terminal takes it over as the foreground). Without perl or $SHELL, or when
+# setsid is refused, the command runs directly.
+login_shell() {
+  if [ -n "${SHELL:-}" ] && command -v perl >/dev/null 2>&1; then
+    perl -MPOSIX -e '
+      my ($sh, $cmd, @args) = @ARGV;
+      if (defined POSIX::setsid()) {
+        my $word = $cmd =~ m{\A[A-Za-z0-9_./-]+\z} ? $cmd : q{"$0"};
+        exec $sh, "-l", "-i", "-c", "$word \"\$@\"", $cmd, @args;
+      }
+      exec $cmd, @args;
+      die "exec $cmd: $!\n";' "$SHELL" "$@"
+  else
+    "$@"
+  fi
+}
+
+if ! login_shell command -v "$CLAUDE_BIN" >/dev/null 2>&1 \
+  && ! command -v "$CLAUDE_BIN" >/dev/null 2>&1; then
+  echo "summarize-transcript: '$CLAUDE_BIN' not found in your login shell (set summary.claudePath in the config or add it to PATH)" >&2
   exit 127
 fi
 if [ "${MT_SEGMENT_COUNT:-1}" = "0" ]; then
@@ -62,7 +87,7 @@ STATUS_FILE="$MEETING_DIR/.hook-status"
   printf -- '--- TRANSCRIPT ---\n'
   cat "$TRANSCRIPT"
 } | {
-  "$CLAUDE_BIN" -p \
+  login_shell "$CLAUDE_BIN" -p \
     --output-format text \
     --allowedTools "Write" "Read" \
     --append-system-prompt "$SYSTEM_PROMPT" \

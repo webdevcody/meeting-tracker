@@ -121,7 +121,8 @@ summary file — and `meet`'s own Claude call), then the write-up as soon as it 
 Two binaries, one tool: `meet` (Rust, the TUI; `crates/meet`) and `meet-rec` (Swift, the
 recording + transcription engine; `Sources/meet`). Pure Swift audio — no BlackHole, no
 Loopback, no cloud for the audio. Claude is only ever called through the `claude` CLI you
-already have. Requires **macOS 26** (Tahoe) on Apple Silicon, Xcode 26, Rust, `claude`
+already have, started through your login shell the way your terminal starts it (see
+[How Claude is called](#how-claude-is-called)). Requires **macOS 26** (Tahoe) on Apple Silicon, Xcode 26, Rust, `claude`
 and `gh` on your `PATH`.
 
 ## Install
@@ -269,12 +270,20 @@ What the keys reach, the mouse reaches too, the way it does in nebula:
   click cycles it); a click outside the overlay closes it, as `Esc` would.
 - **Scroll** with the wheel over the transcript, the right pane or the agent log; over the
   summaries, the action items, the session list or the settings it steps the selection.
+- **Drag** over the transcript to select its text. The highlight follows the pointer, the
+  transcript scrolls along past its top or bottom edge, and the text is copied to the
+  clipboard when the button comes up: as it was said, without the wrap's line breaks or the
+  indentation under the clock. A **double-click** copies the word under the pointer. The
+  highlight stays until the next click. Over ssh, or with no clipboard tool here (`pbcopy`,
+  `wl-copy`, `xclip`, `xsel`), the copy goes through the terminal instead (OSC 52), which
+  some terminals ignore.
 - **Drag** the border between two panes to resize them: the seam between the columns, the
   one between the transcript and the summaries, the one between the action items and the
   prompt. Each carries a short thick grip in its middle, and the pointer turns into resize
   arrows over it in terminals that support that. The shares are kept in `layout.json` in
   the data directory, so the next launch opens the same way (delete the file for the
-  defaults). Hold `⇧` (`⌥` in some terminals) to select text through your terminal instead.
+  defaults). Hold `⇧` (`⌥` in some terminals) to select through your terminal instead,
+  anywhere on the screen.
 
 ### What is kept where
 
@@ -516,6 +525,18 @@ tail (commit, push, `gh pr create`) so a run always ends in a pull request or a 
 error. Both drop `CLAUDECODE` from the environment, so `meet` also works when launched from
 inside a Claude Code session.
 
+Every one of these starts through your login shell, the way nebula starts its sessions:
+`$SHELL -l -i -c 'claude …'`. `-l` and `-i` load `~/.zprofile` and `~/.zshrc` (or bash's
+files), so `claude` sees your terminal's `PATH`; and the command word goes in bare, so an
+alias or function named `claude` wins over the binary, exactly as at a prompt. A work setup
+that picks an account, backend or subscription per directory applies here too, run from the
+directory the call runs in: the repository, or the agent's worktree. `--claude-bin`
+(`$MEET_CLAUDE_BIN`) names another command, resolved the same way. The headless calls run
+in a session of their own, off `meet`'s terminal. A stop, a quit, and closing the question
+pane signal every process group under the shell, not just the shell's own: bash runs
+`claude` as a job in a group of its own and ignores SIGTERM itself. `gh` and `git` are run
+directly, as nebula runs them.
+
 ## The engine: `meet-rec`
 
 `meet-rec` is the recorder the TUI drives (`meet record …` is the same thing). It captures
@@ -679,7 +700,7 @@ All keys are optional; see `config.example.json`:
 | `summary.prompt` / `summary.promptFile` | `--summary-prompt-file` | the instruction sent to `claude -p`. A string, an array of lines, or a file. |
 | `summary.systemPrompt` / `summary.systemPromptFile` | `--summary-system-prompt-file` | text for `claude --append-system-prompt` (output format, file naming, …). |
 | `summary.model` | `--summary-model` | `claude --model …`. Default: Claude's own default. |
-| `summary.claudePath` | — | the `claude` binary if it's not in `PATH`. |
+| `summary.claudePath` | — | the `claude` command to run (default `claude`, resolved by your login shell). |
 | `hooks.onDone` | `--no-hooks` to skip | shell commands run after the transcript is written. |
 | `hooks.env` | — | extra env vars for every hook. Applied last, so they can override any `MT_*` value. |
 | `agent.model` | `--agent-model` | the TUI's implementing agent (`claude --model …`), used while the agent model in the [settings](#settings) is `default`. `"default"` or unset: Claude's own. |
@@ -730,7 +751,9 @@ Markdown summary to `MT_SUMMARY_DIR/<date>_<descriptive-title>.md`, e.g.
 prompt, model and directory come from the `summary` config block above (the script has
 built-in defaults matching `config.example.json` for anything unset). The transcript and a
 short metadata block (date, duration, transcript path, summary directory) are always
-appended after the prompt. Needs `claude` in `PATH` (or `summary.claudePath`); Claude's
+appended after the prompt. It starts `claude` through your login shell as `meet` does (via
+perl's `setsid`, so the interactive shell stays off the terminal), so your rc files and any
+`claude` alias or function apply. Needs `claude` there (or `summary.claudePath`); Claude's
 output is also saved to `<meeting dir>/summary.log`.
 
 ## Output format
@@ -768,11 +791,13 @@ crates/meet/src/        the `meet` TUI (Rust)
   app.rs               TUI state and its transitions
   ui.rs                header, transcript, summaries, action items, prompt pane, overlays
   layout.rs            the seams between the panes (dragged with the mouse; layout.json) and where the last frame drew what, for the clicks
+  selection.rs         selecting transcript text with the mouse, and the copy: pbcopy (or wl-copy, xclip, xsel), else OSC 52
   recorder.rs          `meet-rec record --json` as a child process; transcript replay
   chunker.rs           when a stretch of transcript becomes a chunk to summarize
   suggest.rs           the summarizer / action-item writer (prompt-doctor rules) via `claude -p`
   runner.rs            worktree → agent → commit → push → `gh pr create`; the resume plan
   claude.rs            headless Claude: structured one-shots, streaming agents (resume, stop)
+  shell.rs             every `claude` launch goes through the login shell (rc files, aliases), as in nebula
   hook.rs              the on-done step: the Stop hook settings and `meet hook stop`
   config.rs            the `agent` block of meet.json, with the engine's lookup order
   settings.rs          which Claude model and effort each feature runs with; the settings file (`,`)

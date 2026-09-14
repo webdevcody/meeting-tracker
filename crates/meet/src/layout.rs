@@ -222,6 +222,8 @@ pub struct HitMap {
     /// Each session tab's cells on the bar, with its index in `app.sessions`.
     pub bar_tabs: Vec<(Rect, usize)>,
     pub transcript: Rect,
+    /// The transcript's text, inside its border: a drag there selects, and copies.
+    pub transcript_text: Rect,
     pub summaries: Rect,
     /// Each summary's rows in the Summary pane, with its index in the shown chunks.
     pub summary_rows: Vec<(Rect, usize)>,
@@ -462,6 +464,7 @@ mod tests {
             bar: Rect::new(0, 1, 100, 1),
             bar_tabs: vec![(Rect::new(10, 1, 8, 1), 0), (Rect::new(19, 1, 13, 1), 1)],
             transcript,
+            transcript_text: Rect::default(),
             summaries,
             summary_rows: vec![
                 (Rect::new(1, summaries.y + 1, 44, 2), 0),

@@ -30,6 +30,7 @@ use crate::live::{self, LiveFiles};
 use crate::lookup::{self, LookupConfig, LookupEvent, LookupRequest};
 use crate::recorder::{self, RecorderEvent, RecorderHandle, Segment};
 use crate::runner::{spawn_run, RunContext, RunEvent};
+use crate::selection;
 use crate::settings::{self, Feature, Field, Settings};
 use crate::store::{ActionItem, ItemStatus, Store};
 use crate::suggest::{self, SuggestEvent, SuggestRequest, SuggesterConfig};
@@ -319,6 +320,12 @@ pub async fn run(opts: Opts) -> Result<()> {
             pointer_sent = lp.app.pointer_shape;
             let backend = terminal.backend_mut();
             let _ = write!(backend, "\x1b]22;{}\x1b\\", pointer_sent.osc_name());
+            let _ = backend.flush();
+        }
+        // A copy the terminal was asked to make (OSC 52): over ssh, or with no clipboard tool.
+        if let Some(text) = lp.app.pending_clipboard.take() {
+            let backend = terminal.backend_mut();
+            let _ = write!(backend, "{}", selection::osc52(&text));
             let _ = backend.flush();
         }
         lp.flush_live();
@@ -1331,6 +1338,8 @@ impl Loop {
         };
         let args = ask::claude_args(&launch);
         let env = ask::claude_env(&launch.ctx);
+        // Through the user's login shell, as nebula starts every session (see `shell`).
+        let (program, shell_args) = crate::shell::claude_launch(&launch.claude_bin, &args);
         let (w, h) = crossterm::terminal::size().unwrap_or((120, 40));
         let inner = ui::ask_pane_inner(ratatui::layout::Rect::new(0, 0, w, h), &self.app.layout);
         // The terminal reports on its own channel; a task tags what it says with the
@@ -1338,8 +1347,8 @@ impl Loop {
         let (tx, mut rx) = mpsc::unbounded_channel::<TermEvent>();
         match Term::spawn(
             Spawn {
-                program: &launch.claude_bin,
-                args: &args,
+                program: &program,
+                args: &shell_args,
                 cwd: &self.app.repo,
                 env: &env,
                 cols: inner.width,
@@ -1362,7 +1371,7 @@ impl Loop {
                 }
                 self.app.focus_term();
                 self.app.push_log(format!(
-                    "question session started on {}: {} {}",
+                    "question session started on {}: {} {} (via {program} -l -i)",
                     if self.app.session.is_some() {
                         format!("the session of {}", self.session_label())
                     } else {
@@ -1803,7 +1812,8 @@ impl Loop {
     /// overlay, a source in the header — or closes an overlay when it lands outside it;
     /// the wheel scrolls what it is over; a press on the border between two panes grabs
     /// the seam, dragging moves it, and the shares go to layout.json when the button
-    /// comes up.
+    /// comes up. A drag over the transcript selects its text and copies it when the button
+    /// comes up; a double-click copies a word (`selection`).
     fn on_mouse(&mut self, m: MouseEvent) {
         let (x, y) = (m.column, m.row);
         let target = self.app.hit.hit_at(x, y);
@@ -1812,7 +1822,12 @@ impl Loop {
         // the seam.
         let hover = match (self.app.splitter_drag, target) {
             (Some(drag), _) => Some(drag.which),
-            (None, HitTarget::Splitter(s)) => Some(s),
+            // A selection dragged across a seam does not grab it.
+            (None, HitTarget::Splitter(s))
+                if !self.app.transcript_sel.is_some_and(|sel| sel.dragging) =>
+            {
+                Some(s)
+            }
             _ => None,
         };
         if hover != self.app.hover_splitter {
@@ -1825,11 +1840,23 @@ impl Loop {
             None => PointerShape::Default,
         };
         match m.kind {
-            MouseEventKind::Down(MouseButton::Left) => self.click(x, y, target),
-            MouseEventKind::Drag(MouseButton::Left) => self.app.drag_splitter_to(x, y),
+            MouseEventKind::Down(MouseButton::Left) => {
+                // Any press lets the last selection go; one on the transcript arms the next.
+                if self.app.transcript_sel.take().is_some() {
+                    self.app.dirty = true;
+                }
+                self.click(x, y, target)
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if !self.app.drag_selection_to(x, y) {
+                    self.app.drag_splitter_to(x, y);
+                }
+            }
             MouseEventKind::Up(MouseButton::Left) => {
                 if self.app.release_splitter() {
                     self.save_layout();
+                } else if let Some(text) = self.app.release_selection() {
+                    self.copy(text);
                 }
             }
             MouseEventKind::ScrollUp => self.wheel(target, -WHEEL_LINES),
@@ -1857,7 +1884,13 @@ impl Loop {
                     }
                 }
             }
-            HitTarget::Transcript | HitTarget::Summaries(None) => self.app.focus_panes(),
+            HitTarget::Transcript => {
+                self.app.focus_panes();
+                if let Some(word) = self.app.press_transcript(x, y) {
+                    self.copy(word);
+                }
+            }
+            HitTarget::Summaries(None) => self.app.focus_panes(),
             HitTarget::Summaries(Some(i)) => self.app.pick_chunk(i),
             HitTarget::RightTab(pane) => self.app.show_pane(pane),
             HitTarget::Items(Some(row)) => self.app.select_row(row),
@@ -1877,6 +1910,24 @@ impl Loop {
                     self.close_overlay_by_click();
                 }
             }
+        }
+    }
+
+    /// Put `text` on the clipboard of the machine the user sits at, and say so: this one's,
+    /// or — over ssh, or with no clipboard tool here — the terminal's, by OSC 52, which some
+    /// terminals drop, so the flash names that route rather than promise.
+    fn copy(&mut self, text: String) {
+        let n = text.chars().count();
+        let copied = format!(
+            "copied {n} character{} to the clipboard",
+            if n == 1 { "" } else { "s" }
+        );
+        if !selection::over_ssh() && selection::to_system_clipboard(&text) {
+            self.app.flash(copied, false);
+        } else {
+            self.app.pending_clipboard = Some(text);
+            self.app
+                .flash(format!("{copied} through the terminal (OSC 52)"), false);
         }
     }
 

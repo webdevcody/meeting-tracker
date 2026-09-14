@@ -11,7 +11,7 @@
 //! frame records where it put things — the session tabs, the right pane's tabs, the
 //! summaries, the action items, the overlay — so clicks land on them.
 
-use crate::app::{App, ChunkState, ChunkView, Overlay, RecState, RightPane, WrapUp};
+use crate::app::{App, ChunkState, ChunkView, Overlay, RecState, RightPane, TranscriptLine, WrapUp};
 use crate::engine_hook::{HookRun, HookState};
 use crate::layout::{self, HitMap, LayoutPrefs, Splitter, MIN_PANE_H};
 use crate::lookup::Fact;
@@ -20,8 +20,9 @@ use crate::event_loop::UNFOCUS_HINT;
 use crate::store::{ActionItem, ItemStatus, MeetingRow, RunPhase};
 use crate::stream_json::{tokens_short, Usage};
 use crate::theme::Theme;
+use crate::selection::TextRow;
 use crate::when::{human_duration, local_datetime, local_time, short_datetime};
-use crate::wrap::wrap;
+use crate::wrap::{wrap, wrap_rows};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -533,6 +534,32 @@ fn source_color(source: &str, th: Theme) -> ratatui::style::Color {
     }
 }
 
+/// The transcript as its pane draws it at `width`: a line's first row behind its clock and
+/// source, the rest of the line indented under them. The pane draws these rows and a copy
+/// out of it reads them, so the highlight and the clipboard cannot disagree.
+pub fn transcript_rows(transcript: &[TranscriptLine], width: usize) -> Vec<TextRow> {
+    let mut rows = Vec::new();
+    for (line, t) in transcript.iter().enumerate() {
+        let prefix = format!("{} {:<6} ", clock(t.at), t.source);
+        let indent = prefix.chars().count();
+        let body_w = width.saturating_sub(indent).max(8);
+        for (i, (said, join)) in wrap_rows(&t.text, body_w).into_iter().enumerate() {
+            let (text, lead) = if i == 0 {
+                (format!("{prefix}{said}"), 0)
+            } else {
+                (format!("{}{said}", " ".repeat(indent)), indent)
+            };
+            rows.push(TextRow {
+                line,
+                text,
+                lead,
+                join,
+            });
+        }
+    }
+    rows
+}
+
 fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
     let th = app.theme;
     let b = match &app.session {
@@ -578,37 +605,43 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
             Style::default().fg(th.dim),
         )));
     }
-    for t in transcript {
-        let prefix = format!("{} {:<6} ", clock(t.at), t.source);
-        let plen = prefix.chars().count();
-        let body_w = width.saturating_sub(plen).max(8);
-        for (i, w) in wrap(&t.text, body_w).into_iter().enumerate() {
-            if i == 0 {
-                lines.push(Line::from(vec![
-                    Span::styled(clock(t.at), Style::default().fg(th.dim)),
-                    Span::raw(" "),
-                    Span::styled(
-                        format!("{:<6}", t.source),
-                        Style::default().fg(source_color(&t.source, th)),
-                    ),
-                    Span::raw(" "),
-                    Span::styled(w, Style::default().fg(th.text)),
-                ]));
-            } else {
-                lines.push(Line::from(vec![
-                    Span::raw(" ".repeat(plen)),
-                    Span::styled(w, Style::default().fg(th.text)),
-                ]));
-            }
+    let rows = transcript_rows(transcript, width);
+    for row in &rows {
+        let body = Style::default().fg(th.text);
+        if row.lead > 0 {
+            lines.push(Line::from(vec![
+                Span::raw(&row.text[..row.lead]),
+                Span::styled(&row.text[row.lead..], body),
+            ]));
+            continue;
         }
+        let t = &transcript[row.line];
+        let at = clock(t.at);
+        let source = format!("{:<6}", t.source);
+        let said = &row.text[at.len() + source.len() + 2..];
+        lines.push(Line::from(vec![
+            Span::styled(at, Style::default().fg(th.dim)),
+            Span::raw(" "),
+            Span::styled(source, Style::default().fg(source_color(&t.source, th))),
+            Span::raw(" "),
+            Span::styled(said, body),
+        ]));
     }
     let total = lines.len();
     let h = inner.height as usize;
     let max_scroll = total.saturating_sub(h);
     app.transcript_max = max_scroll;
-    // A past session opens at its start; the live one follows the newest line.
+    // A selection being dragged holds the text still under the pointer, even while the live
+    // transcript follows its newest line.
+    let held = app.transcript_sel.is_some_and(|s| s.dragging);
+    // A past session opens at its start and stays where it was scrolled to; the live one
+    // follows the newest line.
     let scroll = match app.transcript_scroll {
         Some(s) if s < max_scroll => s,
+        Some(_) if viewing => {
+            app.transcript_scroll = Some(max_scroll);
+            max_scroll
+        }
         Some(_) => {
             app.transcript_scroll = None;
             max_scroll
@@ -617,10 +650,39 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
             app.transcript_scroll = Some(0);
             0
         }
+        None if held => app.transcript_top.min(max_scroll),
         None => max_scroll,
     };
+    app.transcript_top = scroll;
+    app.hit.transcript_text = inner;
+    // Wrapped to another width, the rows under a selection are other rows.
+    if app.transcript_sel.is_some_and(|s| s.width != width) {
+        app.transcript_sel = None;
+    }
     let visible: Vec<Line> = lines.into_iter().skip(scroll).take(h).collect();
     f.render_widget(Paragraph::new(visible), inner);
+    // The selection: the cells it covers, reversed — but never a wrapped row's indentation,
+    // which a copy leaves out as well.
+    if let Some(sel) = app.transcript_sel {
+        let reversed = Style::default().add_modifier(Modifier::REVERSED);
+        for (i, row) in rows.iter().enumerate().skip(scroll).take(h) {
+            let Some((first, last)) = sel.span(i) else {
+                continue;
+            };
+            let first = first.max(row.lead);
+            let last = last.min(width - 1);
+            if first > last {
+                continue;
+            }
+            let cells = Rect::new(
+                inner.x + first as u16,
+                inner.y + (i - scroll) as u16,
+                (last - first + 1) as u16,
+                1,
+            );
+            f.buffer_mut().set_style(cells, reversed);
+        }
+    }
     if app.transcript_scroll.is_some() && !viewing {
         let tag = " ↓ G to follow ";
         let r = Rect {
@@ -2036,7 +2098,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App, area: Rect) {
                 ("[ / ]", "scroll the right pane"),
                 (
                     "mouse",
-                    "click a pane, a tab or a session to focus it, a summary or an action item to pick it; the wheel scrolls; drag the border between two panes to resize them (⇧drag selects text through your terminal)",
+                    "click a pane, a tab or a session to focus it, a summary or an action item to pick it; the wheel scrolls; drag over the transcript to copy what it covers, double-click to copy a word; drag the border between two panes to resize them (⇧drag selects through your terminal)",
                 ),
                 (
                     "q, Ctrl+C",
@@ -2253,6 +2315,193 @@ mod tests {
             app.add_chunk(format!("c{i}"), &chunk);
         }
         app
+    }
+
+    /// A live meeting whose transcript holds `lines`, said into the mic five seconds apart.
+    fn talking_app(lines: &[&str]) -> App {
+        let mut app = App::new(
+            "/r".into(),
+            "main".into(),
+            false,
+            Limits::default(),
+            "m".into(),
+            Vec::new(),
+        );
+        app.on_started(String::new(), vec!["mic".into()]);
+        for (i, text) in lines.iter().enumerate() {
+            say(&mut app, i, text);
+        }
+        app
+    }
+
+    /// The `i`th line of the talk: `text`, at `i` × 5 seconds.
+    fn say(app: &mut App, i: usize, text: &str) {
+        use crate::recorder::Segment;
+        let start = i as f64 * 5.0;
+        let _ = app.on_segment(Segment {
+            source: "mic".into(),
+            text: text.into(),
+            start,
+            end: start + 4.0,
+        });
+    }
+
+    /// Sixty lines of talk, `line 0 of the talk` to `line 59 of the talk`.
+    fn long_talk() -> App {
+        let talk: Vec<String> = (0..60).map(|i| format!("line {i} of the talk")).collect();
+        let lines: Vec<&str> = talk.iter().map(String::as_str).collect();
+        talking_app(&lines)
+    }
+
+    /// Draws a frame, and gives back what is drawn reversed — a selection's highlight — on
+    /// row `y` of the transcript's text.
+    fn highlighted(app: &mut App, y: u16) -> String {
+        let mut t = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        t.draw(|f| draw(f, app)).unwrap();
+        let r = app.hit.transcript_text;
+        let buf = t.backend().buffer();
+        (r.x..r.right())
+            .filter(|&x| buf[(x, y)].modifier.contains(Modifier::REVERSED))
+            .map(|x| buf[(x, y)].symbol().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_drag_over_the_transcript_highlights_what_it_covers_and_copies_it() {
+        let mut app = talking_app(&["first stretch of talk", "second stretch of talk"]);
+        render(&mut app, 120, 40);
+        let r = app.hit.transcript_text;
+        assert_eq!(app.hit.hit_at(r.x, r.y), crate::layout::HitTarget::Transcript);
+        // From the f of "first" to the n of "second": armed on the press, a selection once
+        // the pointer moves.
+        assert_eq!(app.press_transcript(r.x + 13, r.y), None);
+        assert!(app.transcript_sel.is_some_and(|s| s.dragging && !s.active));
+        assert!(app.drag_selection_to(r.x + 17, r.y + 1));
+        assert_eq!(highlighted(&mut app, r.y).trim_end(), "first stretch of talk");
+        assert_eq!(highlighted(&mut app, r.y + 1), "00:05 mic    secon");
+        assert_eq!(
+            app.release_selection().as_deref(),
+            Some("first stretch of talk\n00:05 mic    secon")
+        );
+        assert!(
+            app.transcript_sel.is_some_and(|s| s.active && !s.dragging),
+            "the highlight stays after the copy"
+        );
+        assert_eq!(highlighted(&mut app, r.y + 1), "00:05 mic    secon");
+        assert_eq!(app.release_selection(), None, "one copy a drag");
+        assert!(!app.drag_selection_to(r.x, r.y), "no drag without a press");
+    }
+
+    #[test]
+    fn a_click_selects_nothing_and_a_double_click_copies_the_word() {
+        let mut app = talking_app(&["first stretch of talk"]);
+        render(&mut app, 120, 40);
+        let r = app.hit.transcript_text;
+        // The r of "stretch".
+        assert_eq!(app.press_transcript(r.x + 21, r.y), None);
+        assert_eq!(app.release_selection(), None);
+        assert_eq!(app.transcript_sel, None, "a press that did not move selects nothing");
+        assert_eq!(app.press_transcript(r.x + 21, r.y).as_deref(), Some("stretch"));
+        assert_eq!(app.release_selection(), None, "the double-click already copied");
+        assert_eq!(highlighted(&mut app, r.y), "stretch");
+        assert_eq!(app.press_transcript(r.x - 1, r.y), None, "the border is not text");
+    }
+
+    #[test]
+    fn a_wrapped_line_copies_as_it_was_said() {
+        let said = "we should add a json flag to the list command so scripts can read it without scraping the table output";
+        let mut app = talking_app(&[said]);
+        render(&mut app, 80, 30);
+        let r = app.hit.transcript_text;
+        let rows = transcript_rows(app.shown_transcript(), usize::from(r.width));
+        assert!(rows.len() > 1, "the line wraps: {rows:?}");
+        app.press_transcript(r.x + 13, r.y);
+        app.drag_selection_to(r.right() - 1, r.y + rows.len() as u16 - 1);
+        assert_eq!(app.release_selection().as_deref(), Some(said));
+    }
+
+    #[test]
+    fn a_selection_stays_on_its_text_as_lines_arrive_and_the_text_holds_still_under_a_drag() {
+        let mut app = long_talk();
+        render(&mut app, 120, 40);
+        let r = app.hit.transcript_text;
+        let top = app.transcript_top;
+        assert!(top > 0, "following the newest line");
+        // A press on the bottom row; a line arrives while the button is down: nothing moves.
+        app.press_transcript(r.x + 13, r.bottom() - 1);
+        say(&mut app, 60, "a new line");
+        render(&mut app, 120, 40);
+        assert_eq!(app.transcript_top, top, "held still under the pointer");
+        app.drag_selection_to(r.x + 16, r.bottom() - 1);
+        assert_eq!(app.release_selection().as_deref(), Some("line"));
+        // Let go: following again, and the highlight went up a row with its text.
+        assert_eq!(highlighted(&mut app, r.bottom() - 2), "line");
+        assert_eq!(app.transcript_top, top + 1);
+        assert_eq!(highlighted(&mut app, r.bottom() - 1), "");
+    }
+
+    #[test]
+    fn dragging_past_the_edge_scrolls_and_a_reflow_lets_the_selection_go() {
+        let mut app = long_talk();
+        app.transcript_scroll = Some(0);
+        render(&mut app, 120, 40);
+        let r = app.hit.transcript_text;
+        let h = usize::from(r.height);
+        app.press_transcript(r.x + 13, r.y);
+        app.drag_selection_to(r.x + 16, r.bottom());
+        assert_eq!(app.transcript_top, 1, "below the pane: a row further down");
+        render(&mut app, 120, 40);
+        assert_eq!(app.transcript_top, 1);
+        assert_eq!(app.transcript_sel.map(|s| s.head), Some((16, h)));
+        let copied = app.release_selection().unwrap();
+        assert!(copied.starts_with("line 0 of the talk\n00:05 mic    line 1 of"), "{copied}");
+        assert!(copied.ends_with(" mic    line"), "{copied}");
+        assert_eq!(copied.lines().count(), h + 1);
+        // Back up past the top edge: pressed on line 3 (the view starts at line 1), the
+        // anchor stays on line 3 while the transcript scrolls to line 0 under the pointer.
+        app.press_transcript(r.x + 13, r.y + 2);
+        app.drag_selection_to(r.x + 13, r.y - 1);
+        assert_eq!(app.transcript_top, 0);
+        assert_eq!(app.transcript_sel.map(|s| (s.anchor, s.head)), Some(((13, 3), (13, 0))));
+        assert_eq!(app.release_selection().as_deref().map(|t| t.lines().count()), Some(4));
+        // Narrower: the rows under the selection are other rows now.
+        app.layout.left = 0.3;
+        render(&mut app, 120, 40);
+        assert_ne!(app.hit.transcript_text.width, r.width);
+        assert_eq!(app.transcript_sel, None);
+    }
+
+    #[test]
+    fn a_past_session_scrolled_to_its_end_stays_there_and_opening_one_drops_the_selection() {
+        let mut app = long_talk();
+        render(&mut app, 120, 40);
+        let r = app.hit.transcript_text;
+        app.press_transcript(r.x + 13, r.y);
+        app.drag_selection_to(r.x + 16, r.y);
+        assert!(app.release_selection().is_some());
+        let transcript = app.transcript.clone();
+        app.enter_session(crate::app::SessionView {
+            meeting: crate::store::MeetingRow {
+                id: "old".into(),
+                repo_path: "/r".into(),
+                meeting_dir: None,
+                started_at: 1_699_900_000,
+                ended_at: None,
+                segment_count: 60,
+                summary: None,
+            },
+            transcript,
+            chunks: Vec::new(),
+        });
+        assert_eq!(app.transcript_sel, None, "another transcript is on screen");
+        render(&mut app, 120, 40);
+        assert_eq!(app.transcript_top, 0, "a past session opens at its start");
+        app.scroll_transcript(1000);
+        render(&mut app, 120, 40);
+        let end = app.transcript_top;
+        assert!(end > 0);
+        render(&mut app, 120, 40);
+        assert_eq!(app.transcript_top, end, "still at its end a frame later, not back at the start");
     }
 
     /// The character drawn at `(x, y)` of a rendered screen.

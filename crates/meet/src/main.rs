@@ -24,7 +24,9 @@ mod paths;
 mod pr_body;
 mod recorder;
 mod runner;
+mod selection;
 mod settings;
+mod shell;
 mod store;
 mod stream_json;
 mod suggest;
@@ -188,7 +190,7 @@ struct Cli {
     #[arg(long, default_value_t = 90.0, value_name = "SECS")]
     chunk_max_secs: f64,
 
-    /// The claude binary.
+    /// The claude command, resolved by your login shell (an alias or function wins, as at a prompt).
     #[arg(long, default_value = "claude", env = "MEET_CLAUDE_BIN")]
     claude_bin: String,
 

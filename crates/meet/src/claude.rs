@@ -1,7 +1,9 @@
 //! Headless Claude Code (`claude -p`). Two shapes: a one-shot structured answer (the
 //! summarizer) and a long-running agent whose stream is logged and relayed (the runner).
 //! Both drop `CLAUDECODE` from the environment so `meet` also works when launched from
-//! inside a Claude Code session, like the bundled summary hook does.
+//! inside a Claude Code session, like the bundled summary hook does. Both start `claude`
+//! through the user's login shell (see [`crate::shell`]), so it is the `claude` their
+//! terminal would run — rc files, PATH, alias and all — as nebula starts every session.
 //!
 //! The agent keeps its session on disk (no `--no-session-persistence`), so a run that
 //! `meet` took down with it — or that the user stopped — is picked up later with
@@ -19,15 +21,20 @@ use tokio::sync::{mpsc, watch};
 /// How long a stopped agent gets to exit on SIGTERM before its process group is SIGKILLed.
 const STOP_GRACE: Duration = Duration::from_secs(4);
 
-fn command(bin: &str, cwd: &Path) -> tokio::process::Command {
-    let mut cmd = tokio::process::Command::new(bin);
-    cmd.current_dir(cwd)
+/// `bin args…` in `cwd`, through the login shell, with its stdio piped.
+fn command(bin: &str, args: &[String], cwd: &Path) -> tokio::process::Command {
+    let (program, args) = crate::shell::claude_launch(bin, args);
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(args)
+        .current_dir(cwd)
         .env_remove("CLAUDECODE")
         .env_remove("CLAUDE_CODE_ENTRYPOINT")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // Its own session: the shell must not touch the terminal `meet` draws on.
+    crate::shell::own_session(&mut cmd);
     cmd
 }
 
@@ -79,8 +86,8 @@ pub async fn structured(req: Structured<'_>) -> Answer {
 
 /// Runs the call; claude's stdout, once it exited.
 async fn run_structured(req: Structured<'_>) -> Result<String> {
-    let mut cmd = command(req.bin, req.cwd);
-    cmd.args([
+    let budget = format!("{:.2}", req.max_budget_usd);
+    let mut args: Vec<String> = [
         "-p",
         "--output-format",
         "json",
@@ -92,30 +99,36 @@ async fn run_structured(req: Structured<'_>) -> Result<String> {
         "--append-system-prompt",
         req.system_prompt,
         "--max-budget-usd",
-        &format!("{:.2}", req.max_budget_usd),
-    ]);
+        &budget,
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
     if req.tools.is_empty() {
-        cmd.args(["--tools", ""]);
+        args.extend(["--tools".to_string(), String::new()]);
     } else {
-        let list = req.tools.join(",");
-        cmd.args(["--tools", &list]);
-        cmd.arg("--allowedTools");
-        cmd.args(req.tools);
+        args.extend(["--tools".to_string(), req.tools.join(",")]);
+        args.push("--allowedTools".into());
+        args.extend(req.tools.iter().map(|t| t.to_string()));
     }
     if let Some(m) = req.model {
-        cmd.args(["--model", m]);
+        args.extend(["--model".to_string(), m.to_string()]);
     }
     if let Some(e) = req.effort {
-        cmd.args(["--effort", e]);
+        args.extend(["--effort".to_string(), e.to_string()]);
     }
+    let mut cmd = command(req.bin, &args, req.cwd);
     let mut child = cmd.spawn().with_context(|| format!("start {}", req.bin))?;
+    let mut group = crate::shell::GroupKill::new(child.id());
     let mut stdin = child.stdin.take().context("claude stdin")?;
     let prompt = req.prompt.to_string();
     tokio::spawn(async move {
         let _ = stdin.write_all(prompt.as_bytes()).await;
         let _ = stdin.shutdown().await;
     });
-    let output = child.wait_with_output().await.context("wait for claude")?;
+    let output = child.wait_with_output().await;
+    group.disarm();
+    let output = output.context("wait for claude")?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() && stdout.trim().is_empty() {
@@ -227,8 +240,9 @@ pub struct AgentSpawn<'a> {
 
 /// A full-permission `claude -p` agent in `spec.cwd`. Its stream is logged under the run
 /// dir and each step is relayed on `tx`. Flip `stop` to `true` to terminate it: SIGTERM
-/// to its process group, then SIGKILL after [`STOP_GRACE`]. The returned task resolves
-/// when the process is gone.
+/// to every process group under it (the login shell, the agent and the tools it is
+/// running), then SIGKILL after [`STOP_GRACE`]. The returned task resolves when the process
+/// is gone.
 pub fn spawn_agent(
     spec: AgentSpawn<'_>,
     mut stop: watch::Receiver<bool>,
@@ -237,8 +251,7 @@ pub fn spawn_agent(
     use std::io::Write;
     std::fs::create_dir_all(spec.run_dir)
         .with_context(|| format!("create {}", spec.run_dir.display()))?;
-    let mut cmd = command(spec.bin, spec.cwd);
-    cmd.args([
+    let mut args: Vec<String> = [
         "-p",
         "--output-format",
         "stream-json",
@@ -246,27 +259,30 @@ pub fn spawn_agent(
         "--permission-mode",
         "bypassPermissions",
         "--dangerously-skip-permissions",
-    ]);
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
     if let Some(sid) = spec.resume {
-        cmd.args(["--resume", sid]);
+        args.extend(["--resume".to_string(), sid.to_string()]);
     }
     if let Some(m) = spec.model {
-        cmd.args(["--model", m]);
+        args.extend(["--model".to_string(), m.to_string()]);
     }
     if let Some(e) = spec.effort {
-        cmd.args(["--effort", e]);
+        args.extend(["--effort".to_string(), e.to_string()]);
     }
     if let Some(s) = spec.settings {
-        cmd.arg("--settings");
-        cmd.arg(s);
+        args.extend(["--settings".to_string(), s.to_string_lossy().into_owned()]);
     }
+    let mut cmd = command(spec.bin, &args, spec.cwd);
     for (k, v) in &spec.env {
         cmd.env(k, v);
     }
-    // Its own process group, so a stop takes the tools it is running down with it.
-    cmd.process_group(0);
     let mut child = cmd.spawn().with_context(|| format!("start {}", spec.bin))?;
     let pid = child.id();
+    // A quit drops this task mid-run: the whole group goes, not just the shell.
+    let mut group = crate::shell::GroupKill::new(pid);
     let mut stdin = child.stdin.take().context("claude stdin")?;
     let stdout = child.stdout.take().context("claude stdout")?;
     let stderr = child.stderr.take().context("claude stderr")?;
@@ -405,6 +421,7 @@ pub fn spawn_agent(
             }
         }
         let exit_code = child.wait().await.ok().and_then(|s| s.code());
+        group.disarm();
         let stderr = stderr_lines.await.unwrap_or_default();
         if !stderr.trim().is_empty() {
             let _ = writeln!(log, "── stderr\n{}", stderr.trim());
@@ -433,20 +450,23 @@ pub fn spawn_agent(
     }))
 }
 
-/// SIGTERM the agent's process group, then SIGKILL it if it is still there after the grace.
+/// SIGTERM every process group under the agent's login shell, then SIGKILL them if it is
+/// still there after the grace. Not the shell's group alone: an interactive bash runs
+/// `claude` as a job in a group of its own even with no terminal, and ignores SIGTERM itself.
 async fn terminate(child: &mut tokio::process::Child, pid: Option<u32>) {
     let Some(pid) = pid else {
         let _ = child.kill().await;
         return;
     };
-    // Negative pid: the whole group (the agent and the tools it is running).
-    unsafe {
-        libc::kill(-(pid as i32), libc::SIGTERM);
-    }
+    let mut groups = crate::shell::process_groups_under(pid);
+    crate::shell::signal_groups(&groups, libc::SIGTERM);
     if tokio::time::timeout(STOP_GRACE, child.wait()).await.is_err() {
-        unsafe {
-            libc::kill(-(pid as i32), libc::SIGKILL);
+        for g in crate::shell::process_groups_under(pid) {
+            if !groups.contains(&g) {
+                groups.push(g);
+            }
         }
+        crate::shell::signal_groups(&groups, libc::SIGKILL);
         let _ = child.kill().await;
     }
 }

@@ -313,6 +313,28 @@ struct Record: AsyncParsableCommand {
         await session.clearStatus()
         Terminal.restore()
 
+        // The transcript goes to disk first: before the audio merge (re-encoding every
+        // track, which a crash or a parent that stops waiting can cut short) and before any
+        // onDone hook runs `claude`. A failed write is still thrown, but only once the audio
+        // is merged. A checkpoint the ticker was still writing finishes first, so it cannot
+        // land on top of the final transcript.
+        _ = await tickerTask.value
+        let elapsed = await session.elapsed
+        let pausedSecs = await session.pausedSeconds
+        let segments = await session.segments
+        let written = Result {
+            try Output.write(meetingDir: meetingDir,
+                             startedAt: startedAt,
+                             endedAt: endedAt,
+                             durationSecs: elapsed,
+                             pausedSecs: pausedSecs,
+                             locale: speechLocale.identifier,
+                             sources: recorder.sources,
+                             echoCancellation: cfg.echoCancellation,
+                             fast: cfg.fast,
+                             segments: segments)
+        }
+
         // One audio file per meeting: sum the per-source tracks (or just rename a lone one).
         let trackURLs = recorder.sources.map { recorder.audioURL(for: $0) }
         let audioURL = meetingDir.appendingPathComponent(Output.audioFileName)
@@ -336,20 +358,9 @@ struct Record: AsyncParsableCommand {
             log("⚠ could not merge audio into \(Output.audioFileName): \(error) — keeping the per-source files")
         }
 
-        let elapsed = await session.elapsed
-        let pausedSecs = await session.pausedSeconds
-        let output = try Output.write(meetingDir: meetingDir,
-                                      startedAt: startedAt,
-                                      endedAt: endedAt,
-                                      durationSecs: elapsed,
-                                      pausedSecs: pausedSecs,
-                                      locale: speechLocale.identifier,
-                                      sources: recorder.sources,
-                                      echoCancellation: cfg.echoCancellation,
-                                      fast: cfg.fast,
-                                      segments: await session.segments)
+        let output = try written.get()
 
-        let segCount = await session.segments.count
+        let segCount = segments.count
         note("Saved \(output.meetingDir.path)")
         note("  duration \(Output.humanDuration(elapsed)), \(segCount) segment(s)")
         if mergedAudio != nil {
