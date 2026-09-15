@@ -3,7 +3,7 @@ name = "meet"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Talk to your repo: a live meeting transcript becomes action items, action items become Claude Code agents in git worktrees, agents become pull requests."
+description = "Talk to your repo: a live meeting transcript, what the repository says about it as it goes, and the meeting's summary."
 
 [[bin]]
 name = "meet"

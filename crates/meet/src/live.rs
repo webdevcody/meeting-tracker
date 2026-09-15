@@ -3,37 +3,19 @@
 //!
 //! - `transcript.md` — one line per segment, `[mm:ss] source: text`, appended the moment
 //!   it lands (typed notes included), so a reader always sees the meeting up to now;
-//! - `summary.md` — the recording state, the meeting's summary once written, the chunk
-//!   summaries each with what the lookup found for it (facts, contradictions, questions)
-//!   and the action items on the board, rewritten whenever any of that changes.
+//! - `summary.md` — the recording state, and the meeting's summary and write-up once
+//!   written, rewritten whenever any of that changes.
 //!
 //! The database stays the source of truth; these are a readable projection of it.
 
-use crate::app::{App, ChunkState, RecState, TranscriptLine, WrapUp};
-use crate::chunker::clock;
-use crate::lookup::Fact;
-use crate::store::{ActionItem, ChunkRow, ItemStatus, MeetingRow};
+use crate::app::{App, RecState, TranscriptLine, WrapUp};
+use crate::store::MeetingRow;
+use crate::when::clock;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 pub const TRANSCRIPT_FILE: &str = "transcript.md";
 pub const SUMMARY_FILE: &str = "summary.md";
-
-/// The chunk section's heading, with the legend for the lines under each summary.
-pub const SUMMARIES_HEADING: &str = "## Summaries so far (about a minute of talk each; under each: - what the repository and earlier meetings say about it, - ⚠ where what was said contradicts them, - ? questions worth asking)";
-
-/// What the lookup found for one chunk, indented under its summary line.
-fn push_chunk_notes(out: &mut String, facts: &[Fact], contradictions: &[Fact], questions: &[String]) {
-    for f in facts {
-        out.push_str(&format!("  - {}\n", f.line()));
-    }
-    for f in contradictions {
-        out.push_str(&format!("  - ⚠ {}\n", f.line()));
-    }
-    for q in questions {
-        out.push_str(&format!("  - ? {q}\n"));
-    }
-}
 
 pub struct LiveFiles {
     dir: PathBuf,
@@ -97,7 +79,7 @@ pub fn transcript_header(repo_name: &str, started: &str) -> String {
 pub fn summary_text(app: &App, transcript_path: &Path) -> String {
     let mut out = format!(
         "# meet · {} ({}) · this meeting\n",
-        app.repo_name, app.base_branch
+        app.repo_name, app.branch
     );
     let state = match &app.rec {
         RecState::Idle => "not recording (r in meet starts it)".to_string(),
@@ -136,46 +118,6 @@ pub fn summary_text(app: &App, transcript_path: &Path) -> String {
         out.push_str(notes.trim());
         out.push('\n');
     }
-
-    out.push_str(&format!("\n{SUMMARIES_HEADING}\n"));
-    if app.chunks.is_empty() {
-        out.push_str(if app.lookup_disabled {
-            "(off: --no-lookup)\n"
-        } else {
-            "(none yet)\n"
-        });
-    }
-    for c in &app.chunks {
-        let text = match (&c.state, &c.summary) {
-            (_, Some(s)) => s.clone(),
-            (ChunkState::Summarizing, None) => "(looking up…)".into(),
-            (ChunkState::Queued, None) => "(queued)".into(),
-            (ChunkState::Failed(e), None) => format!("(failed: {e})"),
-            (ChunkState::Done, None) => "(no summary)".into(),
-        };
-        out.push_str(&format!(
-            "[{}] {}–{} {text}\n",
-            c.idx + 1,
-            clock(c.start),
-            clock(c.end)
-        ));
-        push_chunk_notes(&mut out, &c.facts, &c.contradictions, &c.questions);
-    }
-
-    out.push_str("\n## Action items on the board\n");
-    if app.items.is_empty() {
-        out.push_str("(none)\n");
-    }
-    for i in &app.items {
-        let mut line = format!("- {} ({})", i.title, i.status.as_str());
-        if i.status == ItemStatus::Done {
-            if let Some(u) = &i.pr_url {
-                line.push_str(&format!(" {u}"));
-            }
-        }
-        out.push_str(&line);
-        out.push('\n');
-    }
     out
 }
 
@@ -186,8 +128,6 @@ pub fn past_summary_text(
     repo_name: &str,
     transcript_path: &Path,
     lines: usize,
-    chunks: &[ChunkRow],
-    items: &[ActionItem],
 ) -> String {
     let mut out = format!(
         "# meet · {repo_name} · meeting of {}\n",
@@ -212,40 +152,12 @@ pub fn past_summary_text(
     out.push_str("\n## Meeting summary\n");
     out.push_str(m.summary.as_deref().unwrap_or("(none was written)"));
     out.push('\n');
-    out.push_str(&format!("\n{SUMMARIES_HEADING}\n"));
-    if chunks.is_empty() {
-        out.push_str("(none)\n");
-    }
-    for c in chunks {
-        out.push_str(&format!(
-            "[{}] {}–{} {}\n",
-            c.idx + 1,
-            clock(c.start_secs),
-            clock(c.end_secs),
-            c.summary.as_deref().unwrap_or("(no summary)")
-        ));
-        push_chunk_notes(&mut out, &c.facts, &c.contradictions, &c.questions);
-    }
-    out.push_str("\n## Action items from this meeting\n");
-    let mine: Vec<&ActionItem> = items.iter().filter(|i| i.meeting_id == m.id).collect();
-    if mine.is_empty() {
-        out.push_str("(none)\n");
-    }
-    for i in mine {
-        out.push_str(&format!("- {} ({})", i.title, i.status.as_str()));
-        if let Some(u) = i.pr_url.as_deref().filter(|_| i.status == ItemStatus::Done) {
-            out.push_str(&format!(" {u}"));
-        }
-        out.push('\n');
-    }
     out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chunker::Limits;
-    use crate::lookup::Lookup;
     use crate::recorder::Segment;
 
     fn app() -> App {
@@ -253,9 +165,7 @@ mod tests {
             "/w/my-app".into(),
             "main".into(),
             false,
-            Limits::default(),
             "m".into(),
-            vec![],
         )
     }
 
@@ -300,8 +210,6 @@ mod tests {
         assert!(s.starts_with("# meet · my-app (main) · this meeting\nstate: not recording"), "{s}");
         assert!(s.contains("transcript: /data/sessions/m/transcript.md (0 lines"), "{s}");
         assert!(s.contains("## Meeting summary\n(written when the recording stops)"), "{s}");
-        assert!(s.contains(&format!("{SUMMARIES_HEADING}\n(none yet)")), "{s}");
-        assert!(s.contains("## Action items on the board\n(none)"), "{s}");
 
         app.on_started("/m/2026".into(), vec!["mic".into()]);
         app.on_segment(Segment {
@@ -310,48 +218,10 @@ mod tests {
             start: 1.0,
             end: 2.0,
         });
-        let chunk = app.chunker.flush().unwrap();
-        app.add_chunk("c1".into(), &chunk);
-        app.on_lookup_done(
-            "c1",
-            Lookup {
-                summary: "said hello".into(),
-                facts: vec![Fact {
-                    text: "README greets".into(),
-                    where_: "README.md:1".into(),
-                }],
-                contradictions: vec![Fact {
-                    text: "said goodbye; the README greets".into(),
-                    where_: String::new(),
-                }],
-                questions: vec!["greet whom?".into()],
-            },
-        );
-        app.items.push(crate::store::ActionItem {
-            id: "a".into(),
-            meeting_id: "m".into(),
-            chunk_id: None,
-            repo_path: "/w/my-app".into(),
-            title: "Add X".into(),
-            prompt: "p".into(),
-            why: String::new(),
-            status: ItemStatus::Done,
-            branch: None,
-            worktree_path: None,
-            pr_url: Some("https://x/pull/3".into()),
-            log_path: None,
-            error: None,
-            session_id: None,
-            phase: crate::store::RunPhase::Agent,
-            created_at: 0,
-            updated_at: 0,
-        });
         let s = summary_text(&app, path);
         assert!(s.contains("state: recording · 00:0"), "{s}");
         assert!(s.contains("(1 line; appended"), "{s}");
         assert!(s.contains("recording files: /m/2026 (audio.m4a"), "{s}");
-        assert!(s.contains("[1] 00:01–00:02 said hello\n  - README greets (README.md:1)\n  - ⚠ said goodbye; the README greets\n  - ? greet whom?\n"), "{s}");
-        assert!(s.contains("- Add X (done) https://x/pull/3\n"), "{s}");
 
         app.on_finished();
         app.wrap_up = WrapUp::Writing;
@@ -380,26 +250,10 @@ mod tests {
             segment_count: 2,
             summary: Some("Talked about greetings.".into()),
         };
-        let chunks = vec![ChunkRow {
-            id: "c".into(),
-            meeting_id: "m".into(),
-            idx: 0,
-            start_secs: 1.0,
-            end_secs: 60.0,
-            text: "t".into(),
-            summary: Some("said hello".into()),
-            facts: vec![Fact {
-                text: "README greets".into(),
-                where_: "README.md:1".into(),
-            }],
-            contradictions: vec![],
-            questions: vec!["greet whom?".into()],
-        }];
-        let s = past_summary_text(&m, "my-app", Path::new("/d/transcript.md"), 2, &chunks, &[]);
+        let s = past_summary_text(&m, "my-app", Path::new("/d/transcript.md"), 2);
         assert!(s.starts_with("# meet · my-app · meeting of "), "{s}");
         assert!(s.contains("state: ended · 01:30 recorded\n"), "{s}");
         assert!(s.contains("## Meeting summary\nTalked about greetings.\n"), "{s}");
-        assert!(s.contains(&format!("{SUMMARIES_HEADING}\n[1] 00:01–01:00 said hello\n  - README greets (README.md:1)\n  - ? greet whom?\n")), "{s}");
-        assert!(s.ends_with("## Action items from this meeting\n(none)\n"), "{s}");
+        assert!(s.ends_with("## Meeting summary\nTalked about greetings.\n"), "{s}");
     }
 }

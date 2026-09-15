@@ -1,5 +1,5 @@
 //! Colors by role, nebula's default palette: cyan accent, yellow for running, green for a
-//! finished job, red for a failure, violet for what is new and unread.
+//! finished job, red for a failure.
 
 use ratatui::style::Color;
 
@@ -10,7 +10,6 @@ pub struct Theme {
     pub muted: Color,
     pub dim: Color,
     pub ok: Color,
-    pub new: Color,
     pub warn: Color,
     pub err: Color,
     pub special: Color,
@@ -26,7 +25,6 @@ impl Default for Theme {
             muted: Color::Gray,
             dim: Color::DarkGray,
             ok: Color::Green,
-            new: Color::Indexed(141),
             warn: Color::Yellow,
             err: Color::Red,
             special: Color::Magenta,

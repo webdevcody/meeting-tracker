@@ -1,9 +1,11 @@
-//! SQLite persistence: meetings (one per `meet` launch) with every transcript segment that
-//! was spoken or typed, the transcript chunks with their summaries, and the action items
-//! with everything an agent run leaves behind (branch, worktree, Claude session id, PR URL,
-//! log). One mutex-guarded connection — the write volume is a few rows a minute.
+//! SQLite persistence: meetings (one per recording) with every transcript segment that was
+//! spoken or typed, and the meeting's summary and write-up. One mutex-guarded connection —
+//! the write volume is a few rows a minute.
+//!
+//! The `chunks` table (the live lookup's per-minute summaries and what it found for them)
+//! and the `action_items` table the migrations create belonged to features meet no longer
+//! has; they are left in place (and unread) so an existing database keeps its rows.
 
-use crate::lookup::{Fact, Lookup};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
@@ -90,112 +92,6 @@ const MIGRATIONS: &[&str] = &[
     ",
 ];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ItemStatus {
-    /// Proposed by the suggester; Enter runs it.
-    Suggested,
-    /// An agent is working in its worktree.
-    Running,
-    /// The user stopped its agent (X). Enter resumes the conversation where it was.
-    Stopped,
-    /// The agent finished and the pull request is open.
-    Done,
-    /// The run stopped short; `error` says where. Enter tries again from where it got to.
-    Failed,
-    /// Hidden by the user.
-    Dismissed,
-}
-
-impl ItemStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Suggested => "suggested",
-            Self::Running => "running",
-            Self::Stopped => "stopped",
-            Self::Done => "done",
-            Self::Failed => "failed",
-            Self::Dismissed => "dismissed",
-        }
-    }
-
-    pub fn parse(s: &str) -> Self {
-        match s {
-            "running" => Self::Running,
-            "stopped" => Self::Stopped,
-            "done" => Self::Done,
-            "failed" => Self::Failed,
-            "dismissed" => Self::Dismissed,
-            _ => Self::Suggested,
-        }
-    }
-
-    /// Enter starts (or resumes) the item from here.
-    pub fn runnable(self) -> bool {
-        matches!(self, Self::Suggested | Self::Stopped | Self::Failed)
-    }
-}
-
-/// Where a run is, so an interrupted one knows what is left to do.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RunPhase {
-    /// The agent is (or was) working; resuming means resuming its conversation.
-    Agent,
-    /// The agent is done; what remains is meet's own commit → push → pull request tail.
-    Publish,
-}
-
-impl RunPhase {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Agent => "agent",
-            Self::Publish => "publish",
-        }
-    }
-
-    pub fn parse(s: &str) -> Self {
-        match s {
-            "publish" => Self::Publish,
-            _ => Self::Agent,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ActionItem {
-    pub id: String,
-    pub meeting_id: String,
-    pub chunk_id: Option<String>,
-    pub repo_path: String,
-    pub title: String,
-    pub prompt: String,
-    pub why: String,
-    pub status: ItemStatus,
-    pub branch: Option<String>,
-    pub worktree_path: Option<String>,
-    pub pr_url: Option<String>,
-    pub log_path: Option<String>,
-    pub error: Option<String>,
-    /// The Claude Code session the agent ran in, once its stream reported one.
-    pub session_id: Option<String>,
-    pub phase: RunPhase,
-    pub created_at: i64,
-    pub updated_at: i64,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ChunkRow {
-    pub id: String,
-    pub meeting_id: String,
-    pub idx: i64,
-    pub start_secs: f64,
-    pub end_secs: f64,
-    pub text: String,
-    pub summary: Option<String>,
-    pub facts: Vec<Fact>,
-    pub contradictions: Vec<Fact>,
-    pub questions: Vec<String>,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct MeetingRow {
     pub id: String,
@@ -204,8 +100,7 @@ pub struct MeetingRow {
     pub started_at: i64,
     pub ended_at: Option<i64>,
     pub segment_count: i64,
-    /// The summary written when the meeting ended, else its first chunk summary — the
-    /// meeting's description, and the context its action items' agents get.
+    /// The summary written when the meeting ended — the meeting's description.
     pub summary: Option<String>,
 }
 
@@ -215,16 +110,6 @@ pub struct SegmentRow {
     pub text: String,
     pub start_secs: f64,
     pub end_secs: f64,
-}
-
-/// What an agent run writes back when it ends.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct RunOutcome {
-    pub branch: Option<String>,
-    pub worktree_path: Option<String>,
-    pub pr_url: Option<String>,
-    pub log_path: Option<String>,
-    pub error: Option<String>,
 }
 
 pub fn now() -> i64 {
@@ -237,9 +122,6 @@ pub fn now() -> i64 {
 pub fn new_id() -> String {
     ulid::Ulid::generate().to_string().to_lowercase()
 }
-
-const ITEM_COLUMNS: &str = "id, meeting_id, chunk_id, repo_path, title, prompt, why, status, branch, worktree_path,
-                    pr_url, log_path, error, created_at, updated_at, session_id, phase";
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -319,7 +201,7 @@ impl Store {
         Ok(())
     }
 
-    /// The meeting's write-up (Markdown), written with its summary and action items.
+    /// The meeting's write-up (Markdown), written with its summary.
     pub fn set_meeting_notes(&self, id: &str, notes: &str) -> Result<()> {
         self.conn.lock().unwrap().execute(
             "UPDATE meetings SET notes = ?2 WHERE id = ?1",
@@ -352,7 +234,7 @@ impl Store {
         Ok(())
     }
 
-    /// Drop a meeting and everything under it (segments, chunks, action items).
+    /// Drop a meeting and everything under it.
     pub fn delete_meeting(&self, id: &str) -> Result<()> {
         self.conn
             .lock()
@@ -361,14 +243,12 @@ impl Store {
         Ok(())
     }
 
-    /// Whether nothing was ever said, looked up or suggested in this meeting — a launch
-    /// that was closed again without a recording.
+    /// Whether nothing was ever said in this meeting — a launch that was closed again
+    /// without a recording.
     pub fn meeting_is_empty(&self, id: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let n: i64 = conn.query_row(
-            "SELECT (SELECT COUNT(*) FROM segments WHERE meeting_id = ?1)
-                  + (SELECT COUNT(*) FROM chunks WHERE meeting_id = ?1)
-                  + (SELECT COUNT(*) FROM action_items WHERE meeting_id = ?1)",
+            "SELECT COUNT(*) FROM segments WHERE meeting_id = ?1",
             params![id],
             |r| r.get(0),
         )?;
@@ -384,9 +264,7 @@ impl Store {
         let ids: Vec<String> = {
             let mut stmt = conn.prepare(
                 "SELECT id FROM meetings m WHERE repo_path = ?1
-                   AND NOT EXISTS (SELECT 1 FROM segments WHERE meeting_id = m.id)
-                   AND NOT EXISTS (SELECT 1 FROM chunks WHERE meeting_id = m.id)
-                   AND NOT EXISTS (SELECT 1 FROM action_items WHERE meeting_id = m.id)",
+                   AND NOT EXISTS (SELECT 1 FROM segments WHERE meeting_id = m.id)",
             )?;
             let rows = stmt.query_map(params![repo_path], |r| r.get(0))?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
@@ -418,9 +296,7 @@ impl Store {
                     CASE WHEN m.ended_at IS NULL
                          THEN (SELECT COUNT(*) FROM segments WHERE meeting_id = m.id)
                          ELSE m.segment_count END,
-                    COALESCE(m.summary,
-                      (SELECT summary FROM chunks WHERE meeting_id = m.id AND summary IS NOT NULL
-                         ORDER BY idx LIMIT 1))
+                    m.summary
              FROM meetings m WHERE m.repo_path = ?1
              ORDER BY m.started_at DESC, m.rowid DESC LIMIT 500",
         )?;
@@ -473,365 +349,11 @@ impl Store {
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
-
-    // ----- chunks -----
-
-    pub fn insert_chunk(
-        &self,
-        meeting_id: &str,
-        idx: i64,
-        start_secs: f64,
-        end_secs: f64,
-        text: &str,
-    ) -> Result<String> {
-        let id = new_id();
-        self.conn.lock().unwrap().execute(
-            "INSERT INTO chunks (id, meeting_id, idx, start_secs, end_secs, text, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![id, meeting_id, idx, start_secs, end_secs, text, now()],
-        )?;
-        Ok(id)
-    }
-
-    /// The lookup's whole answer for a chunk, in one write.
-    pub fn set_chunk_lookup(&self, id: &str, lookup: &Lookup) -> Result<()> {
-        let facts = serde_json::to_string(&lookup.facts)?;
-        let contradictions = serde_json::to_string(&lookup.contradictions)?;
-        let questions = serde_json::to_string(&lookup.questions)?;
-        self.conn.lock().unwrap().execute(
-            "UPDATE chunks SET summary = ?2, facts = ?3, contradictions = ?4, questions = ?5 WHERE id = ?1",
-            params![id, lookup.summary, facts, contradictions, questions],
-        )?;
-        Ok(())
-    }
-
-    pub fn get_chunk(&self, id: &str) -> Result<Option<ChunkRow>> {
-        let conn = self.conn.lock().unwrap();
-        conn.query_row(
-            "SELECT id, meeting_id, idx, start_secs, end_secs, text, summary, facts, contradictions, questions
-             FROM chunks WHERE id = ?1",
-            params![id],
-            row_to_chunk,
-        )
-        .optional()
-        .map_err(Into::into)
-    }
-
-    /// A meeting's chunks in order, with everything the lookup found for them.
-    pub fn list_chunks(&self, meeting_id: &str) -> Result<Vec<ChunkRow>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, meeting_id, idx, start_secs, end_secs, text, summary, facts, contradictions, questions
-             FROM chunks WHERE meeting_id = ?1 ORDER BY idx",
-        )?;
-        let rows = stmt.query_map(params![meeting_id], row_to_chunk)?;
-        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
-    }
-
-    // ----- action items -----
-
-    pub fn insert_item(
-        &self,
-        meeting_id: &str,
-        chunk_id: Option<&str>,
-        repo_path: &str,
-        title: &str,
-        prompt: &str,
-        why: &str,
-    ) -> Result<ActionItem> {
-        let id = new_id();
-        let ts = now();
-        self.conn.lock().unwrap().execute(
-            "INSERT INTO action_items (id, meeting_id, chunk_id, repo_path, title, prompt, why, status, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'suggested', ?8, ?8)",
-            params![id, meeting_id, chunk_id, repo_path, title, prompt, why, ts],
-        )?;
-        Ok(ActionItem {
-            id,
-            meeting_id: meeting_id.to_string(),
-            chunk_id: chunk_id.map(str::to_string),
-            repo_path: repo_path.to_string(),
-            title: title.to_string(),
-            prompt: prompt.to_string(),
-            why: why.to_string(),
-            status: ItemStatus::Suggested,
-            branch: None,
-            worktree_path: None,
-            pr_url: None,
-            log_path: None,
-            error: None,
-            session_id: None,
-            phase: RunPhase::Agent,
-            created_at: ts,
-            updated_at: ts,
-        })
-    }
-
-    pub fn set_item_status(&self, id: &str, status: ItemStatus) -> Result<()> {
-        self.conn.lock().unwrap().execute(
-            "UPDATE action_items SET status = ?2, updated_at = ?3 WHERE id = ?1",
-            params![id, status.as_str(), now()],
-        )?;
-        Ok(())
-    }
-
-    pub fn set_item_session(&self, id: &str, session_id: &str) -> Result<()> {
-        self.conn.lock().unwrap().execute(
-            "UPDATE action_items SET session_id = ?2, updated_at = ?3 WHERE id = ?1",
-            params![id, session_id, now()],
-        )?;
-        Ok(())
-    }
-
-    pub fn set_item_phase(&self, id: &str, phase: RunPhase) -> Result<()> {
-        self.conn.lock().unwrap().execute(
-            "UPDATE action_items SET phase = ?2, updated_at = ?3 WHERE id = ?1",
-            params![id, phase.as_str(), now()],
-        )?;
-        Ok(())
-    }
-
-    /// Status plus whatever the run learned; `None` fields are left as they were.
-    pub fn set_item_outcome(&self, id: &str, status: ItemStatus, out: &RunOutcome) -> Result<()> {
-        self.conn.lock().unwrap().execute(
-            "UPDATE action_items SET status = ?2, updated_at = ?3,
-               branch = COALESCE(?4, branch),
-               worktree_path = COALESCE(?5, worktree_path),
-               pr_url = COALESCE(?6, pr_url),
-               log_path = COALESCE(?7, log_path),
-               error = ?8
-             WHERE id = ?1",
-            params![
-                id,
-                status.as_str(),
-                now(),
-                out.branch,
-                out.worktree_path,
-                out.pr_url,
-                out.log_path,
-                out.error
-            ],
-        )?;
-        Ok(())
-    }
-
-    /// Every item for the repo that is not dismissed, newest first. A row still `running`
-    /// is one whose agent the last `meet` took down with it (quit or crash); it stays
-    /// `running` so the next launch resumes it — see `interrupted_items`.
-    pub fn list_items(&self, repo_path: &str) -> Result<Vec<ActionItem>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {ITEM_COLUMNS}
-             FROM action_items WHERE repo_path = ?1 AND status != 'dismissed'
-             ORDER BY created_at DESC, id DESC LIMIT 500"
-        ))?;
-        let rows = stmt.query_map(params![repo_path], row_to_item)?;
-        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
-    }
-
-    /// Items whose agent was running when the last `meet` exited, oldest first.
-    pub fn interrupted_items(&self, repo_path: &str) -> Result<Vec<ActionItem>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {ITEM_COLUMNS}
-             FROM action_items WHERE repo_path = ?1 AND status = 'running'
-             ORDER BY updated_at ASC, id ASC"
-        ))?;
-        let rows = stmt.query_map(params![repo_path], row_to_item)?;
-        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
-    }
-
-    /// `running` rows become `stopped`: what `--no-resume` does instead of resuming them.
-    pub fn stop_interrupted_items(&self, repo_path: &str) -> Result<usize> {
-        let n = self.conn.lock().unwrap().execute(
-            "UPDATE action_items SET status = 'stopped', updated_at = ?2,
-               error = 'meet exited while the agent was running'
-             WHERE repo_path = ?1 AND status = 'running'",
-            params![repo_path, now()],
-        )?;
-        Ok(n)
-    }
-
-    #[cfg(test)]
-    pub fn get_item(&self, id: &str) -> Result<Option<ActionItem>> {
-        let conn = self.conn.lock().unwrap();
-        conn.query_row(
-            &format!("SELECT {ITEM_COLUMNS} FROM action_items WHERE id = ?1"),
-            params![id],
-            row_to_item,
-        )
-        .optional()
-        .map_err(Into::into)
-    }
-}
-
-fn row_to_chunk(r: &rusqlite::Row<'_>) -> rusqlite::Result<ChunkRow> {
-    Ok(ChunkRow {
-        id: r.get(0)?,
-        meeting_id: r.get(1)?,
-        idx: r.get(2)?,
-        start_secs: r.get(3)?,
-        end_secs: r.get(4)?,
-        text: r.get(5)?,
-        summary: r.get(6)?,
-        facts: json_list(r, 7)?,
-        contradictions: json_list(r, 8)?,
-        questions: json_list(r, 9)?,
-    })
-}
-
-/// A JSON array stored as text; an absent or unreadable column reads as empty.
-fn json_list<T: serde::de::DeserializeOwned>(
-    r: &rusqlite::Row<'_>,
-    idx: usize,
-) -> rusqlite::Result<Vec<T>> {
-    Ok(r
-        .get::<_, Option<String>>(idx)?
-        .and_then(|j| serde_json::from_str(&j).ok())
-        .unwrap_or_default())
-}
-
-fn row_to_item(r: &rusqlite::Row<'_>) -> rusqlite::Result<ActionItem> {
-    Ok(ActionItem {
-        id: r.get(0)?,
-        meeting_id: r.get(1)?,
-        chunk_id: r.get(2)?,
-        repo_path: r.get(3)?,
-        title: r.get(4)?,
-        prompt: r.get(5)?,
-        why: r.get(6)?,
-        status: ItemStatus::parse(&r.get::<_, String>(7)?),
-        branch: r.get(8)?,
-        worktree_path: r.get(9)?,
-        pr_url: r.get(10)?,
-        log_path: r.get(11)?,
-        error: r.get(12)?,
-        created_at: r.get(13)?,
-        updated_at: r.get(14)?,
-        session_id: r.get(15)?,
-        phase: RunPhase::parse(&r.get::<_, String>(16)?),
-    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn items_round_trip_and_running_rows_survive_a_reload() {
-        let store = Store::open_in_memory().unwrap();
-        let meeting = store.insert_meeting("/repo").unwrap();
-        let chunk = store.insert_chunk(&meeting, 0, 0.0, 30.0, "hello").unwrap();
-        store
-            .set_chunk_lookup(
-                &chunk,
-                &Lookup {
-                    summary: "said hello".into(),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        let row = store.get_chunk(&chunk).unwrap().unwrap();
-        assert_eq!(row.summary.as_deref(), Some("said hello"));
-        assert!(row.facts.is_empty(), "no facts yet");
-        assert!(row.contradictions.is_empty());
-        assert!(row.questions.is_empty());
-        let lookup = Lookup {
-            summary: "hello, and a claim".into(),
-            facts: vec![Fact {
-                text: "README says hello".into(),
-                where_: "README.md:1".into(),
-            }],
-            contradictions: vec![Fact {
-                text: "said goodbye; README says hello".into(),
-                where_: "README.md:1".into(),
-            }],
-            questions: vec!["hello or goodbye?".into()],
-        };
-        store.set_chunk_lookup(&chunk, &lookup).unwrap();
-        let row = store.get_chunk(&chunk).unwrap().unwrap();
-        assert_eq!(row.summary.as_deref(), Some("hello, and a claim"));
-        assert_eq!(row.facts, lookup.facts);
-        assert_eq!(row.contradictions, lookup.contradictions);
-        assert_eq!(row.questions, lookup.questions);
-        assert_eq!(store.list_chunks(&meeting).unwrap(), vec![row]);
-
-        let a = store
-            .insert_item(
-                &meeting,
-                Some(&chunk),
-                "/repo",
-                "Add X",
-                "do x",
-                "they said x",
-            )
-            .unwrap();
-        let b = store
-            .insert_item(&meeting, None, "/repo", "Add Y", "do y", "")
-            .unwrap();
-        let _other = store
-            .insert_item(&meeting, None, "/elsewhere", "Z", "z", "")
-            .unwrap();
-        store.set_item_status(&b.id, ItemStatus::Running).unwrap();
-        store.set_item_session(&b.id, "sid-1").unwrap();
-        store.set_item_status(&a.id, ItemStatus::Dismissed).unwrap();
-
-        let items = store.list_items("/repo").unwrap();
-        assert_eq!(items.len(), 1, "dismissed and other-repo rows are hidden");
-        assert_eq!(items[0].id, b.id);
-        assert_eq!(
-            items[0].status,
-            ItemStatus::Running,
-            "a running row is kept for the next launch to resume"
-        );
-        assert_eq!(items[0].session_id.as_deref(), Some("sid-1"));
-        assert_eq!(items[0].phase, RunPhase::Agent);
-
-        let interrupted = store.interrupted_items("/repo").unwrap();
-        assert_eq!(interrupted.len(), 1);
-        assert_eq!(interrupted[0].id, b.id);
-
-        store.set_item_phase(&b.id, RunPhase::Publish).unwrap();
-        assert_eq!(
-            store.get_item(&b.id).unwrap().unwrap().phase,
-            RunPhase::Publish
-        );
-
-        store
-            .set_item_outcome(
-                &b.id,
-                ItemStatus::Done,
-                &RunOutcome {
-                    branch: Some("add-y".into()),
-                    worktree_path: Some("/repo-worktrees/add-y".into()),
-                    pr_url: Some("https://github.com/o/r/pull/7".into()),
-                    log_path: None,
-                    error: None,
-                },
-            )
-            .unwrap();
-        let b2 = store.get_item(&b.id).unwrap().unwrap();
-        assert_eq!(b2.status, ItemStatus::Done);
-        assert_eq!(b2.pr_url.as_deref(), Some("https://github.com/o/r/pull/7"));
-        assert_eq!(b2.error, None, "a successful outcome clears the old error");
-        assert!(store.interrupted_items("/repo").unwrap().is_empty());
-        store.end_meeting(&meeting, 12).unwrap();
-    }
-
-    #[test]
-    fn no_resume_turns_running_rows_into_stopped_ones() {
-        let store = Store::open_in_memory().unwrap();
-        let meeting = store.insert_meeting("/repo").unwrap();
-        let a = store
-            .insert_item(&meeting, None, "/repo", "A", "a", "")
-            .unwrap();
-        store.set_item_status(&a.id, ItemStatus::Running).unwrap();
-        assert_eq!(store.stop_interrupted_items("/repo").unwrap(), 1);
-        let a2 = store.get_item(&a.id).unwrap().unwrap();
-        assert_eq!(a2.status, ItemStatus::Stopped);
-        assert!(a2.status.runnable(), "Enter resumes a stopped item");
-        assert!(a2.error.unwrap().contains("meet exited"));
-    }
 
     #[test]
     fn meetings_keep_their_transcript_and_close_when_stale() {
@@ -843,16 +365,6 @@ mod tests {
         store
             .insert_segment(&m1, "typed", "ship it", 4.0, 4.0)
             .unwrap();
-        let c = store.insert_chunk(&m1, 0, 0.0, 4.0, "…").unwrap();
-        store
-            .set_chunk_lookup(
-                &c,
-                &Lookup {
-                    summary: "greetings and a decision".into(),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
         // The last meet crashed: m1 was never ended.
         assert_eq!(store.close_stale_meetings("/repo").unwrap(), 1);
         let m2 = store.insert_meeting("/repo").unwrap();
@@ -862,7 +374,6 @@ mod tests {
         assert_eq!(segs.len(), 2);
         assert_eq!(segs[0].text, "hello there");
         assert_eq!(segs[1].source, "typed");
-        assert_eq!(store.list_chunks(&m1).unwrap().len(), 1);
 
         let meetings = store.list_meetings("/repo").unwrap();
         assert_eq!(meetings.len(), 2, "other repos' meetings are not listed");
@@ -870,11 +381,7 @@ mod tests {
         assert_eq!(meetings[1].id, m1);
         assert!(meetings[1].ended_at.is_some(), "stale meeting was closed");
         assert_eq!(meetings[1].segment_count, 2);
-        assert_eq!(
-            meetings[1].summary.as_deref(),
-            Some("greetings and a decision"),
-            "the first chunk summary stands in until the meeting has its own"
-        );
+        assert_eq!(meetings[1].summary, None, "no summary until one is written");
         store.set_meeting_summary(&m1, "the whole thing").unwrap();
         let meetings = store.list_meetings("/repo").unwrap();
         assert_eq!(meetings[1].summary.as_deref(), Some("the whole thing"));
@@ -899,20 +406,12 @@ mod tests {
         store
             .insert_segment(&spoken, "mic", "hello", 0.0, 1.0)
             .unwrap();
-        let suggested = store.insert_meeting("/repo").unwrap();
-        store
-            .insert_item(&suggested, None, "/repo", "T", "p", "")
-            .unwrap();
-        let looked_up = store.insert_meeting("/repo").unwrap();
-        store.insert_chunk(&looked_up, 0, 0.0, 1.0, "t").unwrap();
         let empty_open = store.insert_meeting("/repo").unwrap();
         let empty_ended = store.insert_meeting("/repo").unwrap();
         store.end_meeting(&empty_ended, 0).unwrap();
         let elsewhere = store.insert_meeting("/other").unwrap();
         assert!(store.meeting_is_empty(&empty_open).unwrap());
         assert!(!store.meeting_is_empty(&spoken).unwrap());
-        assert!(!store.meeting_is_empty(&suggested).unwrap());
-        assert!(!store.meeting_is_empty(&looked_up).unwrap());
 
         let mut dropped = store.delete_empty_meetings("/repo").unwrap();
         dropped.sort();
@@ -925,10 +424,7 @@ mod tests {
             .into_iter()
             .map(|m| m.id)
             .collect();
-        assert_eq!(kept.len(), 3);
-        for id in [&spoken, &suggested, &looked_up] {
-            assert!(kept.contains(id), "{id} was dropped");
-        }
+        assert_eq!(kept, vec![spoken.clone()]);
         assert_eq!(
             store.list_meetings("/other").unwrap()[0].id,
             elsewhere,
@@ -938,7 +434,7 @@ mod tests {
 
         store.delete_meeting(&spoken).unwrap();
         assert!(store.list_segments(&spoken).unwrap().is_empty(), "cascaded");
-        assert_eq!(store.list_meetings("/repo").unwrap().len(), 2);
+        assert!(store.list_meetings("/repo").unwrap().is_empty());
         assert!(
             store.meeting_is_empty("nope").unwrap(),
             "an unknown id holds nothing"
@@ -954,7 +450,6 @@ mod tests {
             s.insert_meeting("/r").unwrap();
         }
         let s = Store::open(&path).unwrap();
-        assert!(s.list_items("/r").unwrap().is_empty());
         assert_eq!(s.list_meetings("/r").unwrap().len(), 1);
     }
 
@@ -971,19 +466,8 @@ mod tests {
                 [],
             )
             .unwrap();
-            conn.execute(
-                "INSERT INTO action_items (id, meeting_id, repo_path, title, prompt, status, created_at, updated_at)
-                 VALUES ('i', 'm', '/r', 'T', 'p', 'running', 1, 1)",
-                [],
-            )
-            .unwrap();
         }
         let s = Store::open(&path).unwrap();
-        let items = s.list_items("/r").unwrap();
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].session_id, None);
-        assert_eq!(items[0].phase, RunPhase::Agent);
-        assert_eq!(items[0].status, ItemStatus::Running);
         let meetings = s.list_meetings("/r").unwrap();
         assert_eq!(meetings[0].summary, None);
         s.set_meeting_summary("m", "s").unwrap();

@@ -1,50 +1,42 @@
-//! The loop: keys from the terminal, events from the recorder, the live lookup, the
-//! suggester and the agent runs, and a one-second tick, all on one `tokio::select!`;
-//! redraws when something changed.
+//! The loop: keys from the terminal, events from the recorder, the suggester and the
+//! question terminals, and a one-second tick, all on one `tokio::select!`; redraws when
+//! something changed.
 //!
-//! Nothing records until `r`. While the recording goes, every closed chunk is looked up
-//! (summary, facts, contradictions, questions). `x` stops the recording and stays: the
-//! whole transcript then goes to the suggester once, and the action items land on the
-//! board; `r` then starts the next recording as a new session (the ended one is closed
+//! Nothing records until `r`, and nothing calls Claude while it records. `x` stops the
+//! recording and stays: the whole transcript then goes to the suggester once, for the
+//! meeting's summary and
+//! write-up; `r` then starts the next recording as a new session (the ended one is closed
 //! and slides along the bar), and whatever is still working on the ended meeting — its
 //! summary call, the engine's onDone hooks — finishes in the background and lands on it:
 //! recorder events are tagged with the recorder they came from, and the suggester's
-//! answer with its meeting. On launch, agents the last `meet` took down with it are
-//! resumed before anything else (unless `--no-resume`); on quit, running agents get a
-//! SIGTERM so Claude flushes their sessions, and their rows stay `running` for the next
-//! launch to pick up. A session that is closed again without a word said is dropped (and
-//! any such leftovers from a crash on the way in), so the session bar holds only real
+//! answer with its meeting. A session that is closed again without a word said is dropped
+//! (and any such leftovers from a crash on the way in), so the session bar holds only real
 //! sessions.
 
 use crate::app::{
-    App, ChunkState, Overlay, RecState, RightPane, SessionView, TranscriptLine,
+    App, Overlay, RecState, RightPane, SessionView, TranscriptLine,
     WrapUp,
 };
 use crate::ask::{self, AskContext};
 use crate::engine_hook::HookState;
 use crate::term::{Spawn, Term, TermEvent};
-use crate::chunker::{Chunk, Limits};
-use crate::knowledge;
 use crate::layout::{HitTarget, LayoutPrefs, PointerShape, Splitter};
 use crate::live::{self, LiveFiles};
-use crate::lookup::{self, LookupConfig, LookupEvent, LookupRequest};
 use crate::recorder::{self, RecorderEvent, RecorderHandle, Segment};
-use crate::runner::{spawn_run, RunContext, RunEvent};
 use crate::selection;
 use crate::settings::{self, Feature, Field, Settings};
-use crate::store::{ActionItem, ItemStatus, Store};
+use crate::store::Store;
 use crate::suggest::{self, SuggestEvent, SuggestRequest, SuggesterConfig};
-use crate::{config, git, ui};
+use crate::{git, ui};
 use anyhow::{Context, Result};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use std::collections::HashMap;
 use std::io::{Stdout, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 
 pub struct Opts {
     pub dir: PathBuf,
@@ -53,22 +45,11 @@ pub struct Opts {
     pub recorder: Option<String>,
     /// Flags for `meet-rec record`.
     pub record_args: Vec<String>,
-    /// `--config`: the meet.json to read (the engine gets the same flag).
-    pub config: Option<String>,
     pub claude_bin: String,
-    pub gh_bin: String,
     /// The `--*-model` / `--*-effort` flags passed this launch; they win over the settings.
     pub overrides: settings::Overrides,
-    pub lookup_budget_usd: f64,
-    pub no_lookup: bool,
     pub suggest_budget_usd: f64,
     pub no_suggest: bool,
-    /// Leave interrupted agents stopped instead of resuming them on launch.
-    pub no_resume: bool,
-    /// `--on-done` / `--on-done-file`: overrides the config's `agent.onDone`.
-    pub on_done: Option<String>,
-    pub limits: Limits,
-    pub remote: String,
 }
 
 const FRAME: Duration = Duration::from_millis(33);
@@ -82,8 +63,6 @@ const FINALIZE_FOR: Duration = Duration::from_secs(45);
 /// How long a discard (`D`) waits for the engine to delete the meeting directory and exit
 /// before meet leaves anyway (and deletes the directory itself).
 const DISCARD_FOR: Duration = Duration::from_secs(10);
-/// How long running agents get to exit on SIGTERM when meet quits.
-const AGENT_EXIT_GRACE: Duration = Duration::from_millis(1500);
 
 /// What `r` starts.
 enum Source {
@@ -106,23 +85,16 @@ struct Loop {
     rec_tx: mpsc::UnboundedSender<(u64, RecorderEvent)>,
     /// The recorder started last; events tagged with an earlier number are a predecessor's.
     rec_gen: u64,
-    lookup_tx: mpsc::UnboundedSender<LookupRequest>,
     suggest_cfg: SuggesterConfig,
     suggest_tx: mpsc::UnboundedSender<SuggestEvent>,
-    run_tx: mpsc::UnboundedSender<RunEvent>,
-    run_ctx: RunContext,
+    /// The claude command every call and the question session start.
+    claude_bin: String,
     /// Output and exits of the question terminals, tagged with the meeting each is about.
     term_tx: mpsc::UnboundedSender<(String, TermEvent)>,
-    /// The lookup worker reads this before every call; `apply_settings` writes it.
-    lookup_cfg: watch::Sender<LookupConfig>,
-    /// `agent.model` from meet.json: what a `default` agent model setting falls through to.
-    config_agent_model: Option<String>,
     /// The question session's model and effort (`a`), as the settings resolve them.
     ask_model: Option<String>,
     ask_effort: Option<String>,
-    /// item id → the stop switch of its running agent.
-    stops: HashMap<String, watch::Sender<bool>>,
-    /// Set by a quit while recording: leave once the engine has finished, no action items.
+    /// Set by a quit while recording: leave once the engine has finished, no summary.
     finalize_deadline: Option<tokio::time::Instant>,
     /// Set by `x`: give up waiting for the engine's `finished` after this and wrap up anyway.
     stop_deadline: Option<tokio::time::Instant>,
@@ -130,8 +102,9 @@ struct Loop {
 
 pub async fn run(opts: Opts) -> Result<()> {
     let repo = git::toplevel(&opts.dir).await?;
-    let base_branch = git::current_branch(&repo).await?;
-    let cfg = config::load(opts.config.as_deref().map(Path::new), &repo)?;
+    let branch = git::current_branch(&repo)
+        .await
+        .unwrap_or_else(|_| "detached HEAD".into());
     let settings = Settings::load()?;
     let store = Store::open(&crate::paths::db_path())?;
     let repo_key = repo.to_string_lossy().into_owned();
@@ -140,13 +113,6 @@ pub async fn run(opts: Opts) -> Result<()> {
     for id in store.delete_empty_meetings(&repo_key).unwrap_or_default() {
         let _ = std::fs::remove_dir_all(crate::paths::session_dir(&id));
     }
-    let interrupted = if opts.no_resume {
-        store.stop_interrupted_items(&repo_key)?;
-        Vec::new()
-    } else {
-        store.interrupted_items(&repo_key)?
-    };
-    let items = store.list_items(&repo_key)?;
     let meeting_id = store.insert_meeting(&repo_key)?;
     let sessions = store.list_meetings(&repo_key)?;
 
@@ -163,42 +129,22 @@ pub async fn run(opts: Opts) -> Result<()> {
     };
     let (rec_tx, mut rec_rx) = mpsc::unbounded_channel::<(u64, RecorderEvent)>();
 
-    let (lookup_tx, lookup_rx) = mpsc::unbounded_channel::<LookupRequest>();
-    let (lookup_ev_tx, mut lookup_ev_rx) = mpsc::unbounded_channel::<LookupEvent>();
-    // The model and effort are filled in by `apply_settings`, and the knowledge brief by
-    // `refresh_knowledge`, before the first chunk.
-    let (lookup_cfg, lookup_cfg_rx) = watch::channel(LookupConfig {
-        claude_bin: opts.claude_bin.clone(),
-        model: None,
-        effort: None,
-        repo: repo.clone(),
-        max_budget_usd: opts.lookup_budget_usd,
-        knowledge: String::new(),
-    });
-    let _lookup = lookup::spawn_worker(lookup_cfg_rx, lookup_rx, lookup_ev_tx);
     let (suggest_tx, mut suggest_rx) = mpsc::unbounded_channel::<SuggestEvent>();
-    let (run_tx, mut run_rx) = mpsc::unbounded_channel::<RunEvent>();
     let (term_tx, mut term_rx) = mpsc::unbounded_channel::<(String, TermEvent)>();
 
     let mut app = App::new(
         repo.clone(),
-        base_branch.clone(),
+        branch,
         opts.replay.is_some(),
-        opts.limits.clone(),
         meeting_id,
-        items,
     );
     app.sessions = sessions;
-    app.lookup_disabled = opts.no_lookup || opts.no_suggest;
     app.suggest_disabled = opts.no_suggest;
     app.settings = settings;
     app.overrides = opts.overrides.clone();
     match LayoutPrefs::load() {
         Ok(layout) => app.layout = layout,
         Err(e) => app.push_log(format!("⚠ {e:#}; the panes take their default sizes")),
-    }
-    if let Some(p) = &cfg.path {
-        app.push_log(format!("agent config: {}", p.display()));
     }
     let settings_path = Settings::path();
     app.push_log(if settings_path.is_file() {
@@ -209,7 +155,6 @@ pub async fn run(opts: Opts) -> Result<()> {
             settings_path.display()
         )
     });
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("meet"));
     let mut lp = Loop {
         app,
         store,
@@ -218,7 +163,6 @@ pub async fn run(opts: Opts) -> Result<()> {
         source,
         rec_tx,
         rec_gen: 0,
-        lookup_tx,
         suggest_cfg: SuggesterConfig {
             claude_bin: opts.claude_bin.clone(),
             model: None,
@@ -227,39 +171,18 @@ pub async fn run(opts: Opts) -> Result<()> {
             max_budget_usd: opts.suggest_budget_usd,
         },
         suggest_tx,
-        run_tx,
-        run_ctx: RunContext {
-            repo: repo.clone(),
-            base_branch,
-            remote: opts.remote.clone(),
-            claude_bin: opts.claude_bin.clone(),
-            gh_bin: opts.gh_bin.clone(),
-            agent_model: None,
-            agent_effort: None,
-            meeting_context: String::new(),
-            on_done: opts.on_done.clone().or(cfg.agent.on_done.clone()),
-            exe,
-        },
+        claude_bin: opts.claude_bin.clone(),
         term_tx,
-        lookup_cfg,
-        config_agent_model: cfg.agent.model.clone(),
         ask_model: None,
         ask_effort: None,
-        stops: HashMap::new(),
         finalize_deadline: None,
         stop_deadline: None,
     };
     lp.apply_settings();
-    lp.refresh_knowledge();
     lp.open_live_files();
     let models = lp.models_line();
     lp.app.push_log(format!("models: {models}"));
-    if lp.run_ctx.on_done.is_some() {
-        lp.app
-            .push_log("on-done prompt configured; agents get it through a Stop hook".into());
-    }
     lp.app.push_log("nothing is recording — r starts the recording".into());
-    lp.resume_interrupted(interrupted);
 
     let mut terminal = setup_terminal()?;
     let mut input = crossterm::event::EventStream::new();
@@ -279,10 +202,7 @@ pub async fn run(opts: Opts) -> Result<()> {
             _ = tokio::time::sleep_until(next_draw), if lp.app.dirty => {}
             _ = tokio::time::sleep_until(next_tick) => {
                 next_tick = tokio::time::Instant::now() + TICK;
-                if let Some(chunk) = lp.app.tick() {
-                    lp.enqueue_chunk(chunk);
-                }
-                lp.refresh_log_overlay();
+                lp.app.tick();
                 if let Some(deadline) = lp.finalize_deadline {
                     if tokio::time::Instant::now() >= deadline {
                         lp.app.push_log("⚠ the recorder did not finish in time; leaving".into());
@@ -294,9 +214,7 @@ pub async fn run(opts: Opts) -> Result<()> {
                     lp.app.push_log(
                         "⚠ the recorder did not finish in time; the transcript so far is kept".into(),
                     );
-                    if let Some(chunk) = lp.app.on_engine_exited(None) {
-                        lp.enqueue_chunk(chunk);
-                    }
+                    lp.app.on_engine_exited(None);
                     lp.wrap_up();
                 }
             }
@@ -309,9 +227,7 @@ pub async fn run(opts: Opts) -> Result<()> {
                 None => break Ok(()),
             },
             ev = rec_rx.recv() => if let Some((gen, ev)) = ev { lp.on_recorder(gen, ev) },
-            ev = lookup_ev_rx.recv() => if let Some(ev) = ev { lp.on_lookup(ev) },
             ev = suggest_rx.recv() => if let Some(ev) = ev { lp.on_suggest(ev) },
-            ev = run_rx.recv() => if let Some(ev) = ev { lp.on_run(ev) },
             ev = term_rx.recv() => if let Some((id, ev)) = ev { lp.on_term(&id, ev) },
         }
         // The pointer shape (OSC 22): resize arrows over a seam. Terminals that do not
@@ -358,35 +274,6 @@ pub async fn run(opts: Opts) -> Result<()> {
             eprintln!("meeting saved to {dir}");
         }
     }
-    let done: Vec<_> = lp
-        .app
-        .items
-        .iter()
-        .filter(|i| i.status == ItemStatus::Done)
-        .collect();
-    if !done.is_empty() {
-        eprintln!("pull requests opened this session:");
-        for i in done {
-            if let Some(u) = &i.pr_url {
-                eprintln!("  {u}  {}", i.title);
-            }
-        }
-    }
-    // Running agents: a SIGTERM so Claude flushes the session, then a moment to exit. Their
-    // rows stay `running`, which is what the next launch resumes.
-    if !lp.stops.is_empty() {
-        let n = lp.stops.len();
-        for stop in lp.stops.values() {
-            let _ = stop.send(true);
-        }
-        eprintln!(
-            "{n} agent{} still running — stopped; `meet` resumes {} next time it runs here (--no-resume to leave {} stopped)",
-            if n == 1 { "" } else { "s" },
-            if n == 1 { "it" } else { "them" },
-            if n == 1 { "it" } else { "them" },
-        );
-        tokio::time::sleep(AGENT_EXIT_GRACE).await;
-    }
     result
 }
 
@@ -395,26 +282,8 @@ impl Loop {
         self.app.repo.to_string_lossy().into_owned()
     }
 
-    /// Agents the last `meet` left running are started again, oldest first.
-    fn resume_interrupted(&mut self, items: Vec<ActionItem>) {
-        if items.is_empty() {
-            return;
-        }
-        let n = items.len();
-        for item in items {
-            self.start_run(item, true);
-        }
-        self.app.flash(
-            format!(
-                "resumed {n} agent{} from the last session",
-                if n == 1 { "" } else { "s" }
-            ),
-            false,
-        );
-    }
-
     /// Every transcript line is kept in the database as it lands, so the session can be
-    /// read back later — and closes a chunk when it fills one.
+    /// read back later, and appended to the live transcript file.
     fn push_segment(&mut self, seg: Segment) {
         if let Err(e) = self.store.insert_segment(
             &self.app.meeting_id,
@@ -437,9 +306,7 @@ impl Loop {
                     .push_log(format!("⚠ could not append to the live transcript: {e:#}"));
             }
         }
-        if let Some(chunk) = self.app.on_segment(seg) {
-            self.enqueue_chunk(chunk);
-        }
+        self.app.on_segment(seg);
     }
 
     /// Rewrite `summary.md` when what it describes changed.
@@ -458,43 +325,8 @@ impl Loop {
         }
     }
 
-    /// A closed chunk goes to the live lookup.
-    fn enqueue_chunk(&mut self, chunk: Chunk) {
-        if self.app.lookup_disabled || self.app.discard {
-            return;
-        }
-        let idx = self.app.chunks.len() as i64;
-        let text = chunk.text();
-        let id = match self
-            .store
-            .insert_chunk(&self.app.meeting_id, idx, chunk.start, chunk.end, &text)
-        {
-            Ok(id) => id,
-            Err(e) => {
-                self.app
-                    .push_log(format!("⚠ could not save the chunk: {e:#}"));
-                return;
-            }
-        };
-        let previous_text = self.app.chunks.last().map(|c| c.text.clone());
-        let idx = self.app.add_chunk(id.clone(), &chunk);
-        let req = LookupRequest {
-            chunk_id: id,
-            chunk_idx: idx,
-            chunk_text: text,
-            start: chunk.start,
-            end: chunk.end,
-            previous_text,
-            summaries_so_far: self.app.summaries(),
-            facts_so_far: self.app.fact_lines(),
-            contradictions_so_far: self.app.contradiction_lines(),
-            questions_so_far: self.app.question_lines(),
-        };
-        let _ = self.lookup_tx.send(req);
-    }
-
     /// The recording is over: the whole transcript goes to the suggester once — for the
-    /// meeting's summary, its write-up and its action items — and the Summary pane takes
+    /// meeting's summary and its write-up — and the Summary pane takes
     /// the right pane to show that, and the engine's hooks, at work. Skipped when
     /// quitting, or when nothing was said.
     fn wrap_up(&mut self) {
@@ -512,7 +344,7 @@ impl Loop {
         if transcript.trim().is_empty() {
             self.app.wrap_up = WrapUp::Done;
             self.app
-                .flash("nothing was said — no summary or action items to write".into(), true);
+                .flash("nothing was said — no summary to write".into(), true);
             return;
         }
         self.app.wrap_up = WrapUp::Writing;
@@ -525,11 +357,6 @@ impl Loop {
             SuggestRequest {
                 meeting_id: self.app.meeting_id.clone(),
                 transcript,
-                summaries: self.app.summaries(),
-                facts: self.app.fact_lines(),
-                contradictions: self.app.contradiction_lines(),
-                questions: self.app.question_lines(),
-                board: self.app.board(),
             },
             self.suggest_tx.clone(),
         );
@@ -573,7 +400,7 @@ impl Loop {
     }
 
     /// Throw the recording away and quit: the engine stops, deletes its meeting directory
-    /// and runs no hook; nothing more is looked up or written; the session is deleted on
+    /// and runs no hook; nothing more is written; the session is deleted on
     /// the way out (see the end of `run`).
     fn discard_now(&mut self) {
         self.app.overlay = None;
@@ -590,7 +417,7 @@ impl Loop {
         self.app.dirty = true;
     }
 
-    /// Stop the recording and stay: the engine finalizes, then the action items are written.
+    /// Stop the recording and stay: the engine finalizes, then the summary is written.
     fn stop_recording(&mut self) {
         self.app.overlay = None;
         if !self.app.is_live() {
@@ -609,8 +436,8 @@ impl Loop {
 
     /// `r`: start recording. The first time, into the session this launch opened (dated
     /// from now, not from the launch); after a recording ended, into a new session — the
-    /// ended one is closed and slides along the bar, and the transcript, the summaries,
-    /// the clock and the Related pane start over. Whatever is still working on the ended
+    /// ended one is closed and slides along the bar, and the transcript, the clock and the
+    /// summary pane start over. Whatever is still working on the ended
     /// meeting (its summary call, the engine's onDone hooks) finishes in the background
     /// and lands on that meeting.
     fn start_recording(&mut self) {
@@ -656,10 +483,7 @@ impl Loop {
     fn close_meeting(&mut self) {
         let id = self.app.meeting_id.clone();
         let segs = self.app.transcript.len() as i64;
-        let empty = segs == 0
-            && self.app.chunks.is_empty()
-            && !self.app.items.iter().any(|i| i.meeting_id == id)
-            && self.store.meeting_is_empty(&id).unwrap_or(false);
+        let empty = segs == 0 && self.store.meeting_is_empty(&id).unwrap_or(false);
         if empty {
             let _ = self.store.delete_meeting(&id);
             let _ = std::fs::remove_dir_all(crate::paths::session_dir(&id));
@@ -682,9 +506,6 @@ impl Loop {
         };
         self.app.begin_meeting(id);
         self.refresh_sessions();
-        // The meeting that just ended is a past one now: what it concluded goes with
-        // every lookup of the new one.
-        self.refresh_knowledge();
         self.app.flash(
             "new session — the last one is on the bar to the right".into(),
             false,
@@ -702,21 +523,6 @@ impl Loop {
         }
         self.app.bar_first = 0;
         self.app.dirty = true;
-    }
-
-    /// What earlier meetings here concluded — sent with every lookup of this one. On
-    /// launch, and again when a new meeting opens (the one that just ended counts then).
-    fn refresh_knowledge(&mut self) {
-        let past: Vec<_> = self
-            .app
-            .sessions
-            .iter()
-            .filter(|m| m.id != self.app.meeting_id)
-            .take(knowledge::MAX_MEETINGS * 2)
-            .map(|m| (m.clone(), self.store.list_chunks(&m.id).unwrap_or_default()))
-            .collect();
-        let brief = knowledge::brief(&past, &self.app.items);
-        self.lookup_cfg.send_modify(|c| c.knowledge = brief);
     }
 
     /// The live meeting's transcript and summary files, fresh (a new header, dated by the
@@ -907,9 +713,7 @@ impl Loop {
                 if !meeting_dir.is_empty() {
                     self.app.meeting_dir = Some(meeting_dir);
                 }
-                if let Some(chunk) = self.app.on_finished() {
-                    self.enqueue_chunk(chunk);
-                }
+                self.app.on_finished();
                 let msg = match &self.app.meeting_dir {
                     Some(d) => format!("meeting saved to {d}"),
                     None => "replay finished".into(),
@@ -929,63 +733,14 @@ impl Loop {
             RecorderEvent::Exited { code } => {
                 self.stop_deadline = None;
                 self.app.hooks.on_engine_exited();
-                if let Some(chunk) = self.app.on_engine_exited(code) {
-                    self.enqueue_chunk(chunk);
-                }
+                self.app.on_engine_exited(code);
                 if self.finalize_deadline.take().is_some() {
                     self.app.should_quit = true;
                 } else {
                     // Without a `finished` first, this is the engine dying: still write
-                    // the action items from what was heard.
+                    // the summary from what was heard.
                     self.wrap_up();
                 }
-            }
-        }
-    }
-
-    fn on_lookup(&mut self, ev: LookupEvent) {
-        match ev {
-            LookupEvent::Started { chunk_id } => {
-                if let Some(c) = self.app.chunk_mut(&chunk_id) {
-                    c.state = ChunkState::Summarizing;
-                }
-                self.app.dirty = true;
-                self.app.live_stale = true;
-            }
-            LookupEvent::Done {
-                chunk_id,
-                lookup,
-                usage,
-            } => {
-                self.app.add_usage(usage);
-                let _ = self.store.set_chunk_lookup(&chunk_id, &lookup);
-                // A chunk of the live meeting (not of one left behind for a new
-                // recording): its first summary describes the session until the
-                // meeting's own is written.
-                if self.app.chunks.iter().any(|c| c.id == chunk_id) {
-                    if let Some(m) = self.app.sessions.first_mut() {
-                        if m.summary.is_none() {
-                            m.summary = Some(lookup.summary.clone());
-                        }
-                    }
-                }
-                self.app.on_lookup_done(&chunk_id, lookup);
-            }
-            LookupEvent::Failed {
-                chunk_id,
-                chunk_idx,
-                error,
-                usage,
-            } => {
-                self.app.add_usage(usage);
-                if let Some(c) = self.app.chunk_mut(&chunk_id) {
-                    c.state = ChunkState::Failed(crate::stream_json::excerpt(&error, 120));
-                }
-                self.app.live_stale = true;
-                self.app.push_log(format!(
-                    "⚠ lookup failed on chunk {}: {error}",
-                    chunk_idx + 1
-                ));
             }
         }
     }
@@ -1023,48 +778,17 @@ impl Loop {
                 }
                 if current {
                     self.app.meeting_summary = Some(suggestion.summary.clone());
+                    self.app.wrap_up = WrapUp::Done;
                     self.app.live_stale = true;
                 }
-                let repo_key = self.repo_key();
-                let mut new = Vec::new();
-                for s in &suggestion.items {
-                    match self.store.insert_item(
-                        &meeting_id,
-                        None,
-                        &repo_key,
-                        &s.title,
-                        &s.prompt,
-                        &s.why,
-                    ) {
-                        Ok(item) => new.push(item),
-                        Err(e) => self
-                            .app
-                            .push_log(format!("⚠ could not save an action item: {e:#}")),
-                    }
-                }
-                let n = new.len();
-                self.app.insert_items(new);
-                if current {
-                    self.app.wrap_up = WrapUp::Done;
-                }
-                let plural = if n == 1 { "" } else { "s" };
-                let msg = match (n, current, self.app.session.is_some(), self.app.right_pane) {
-                    (0, false, _, _) => {
-                        "the previous meeting's summary is written — no action items came out of it".to_string()
-                    }
-                    (n, false, _, _) => format!(
-                        "the previous meeting's summary is written · {n} action item{plural} on the board"
-                    ),
-                    (0, true, _, _) => "summary written — no action items came out of this meeting".to_string(),
-                    (n, true, true, _) => format!("summary written · {n} action item{plural} on the live board"),
-                    (n, true, false, RightPane::Items) => {
-                        format!("summary written · {n} action item{plural} — Enter runs the selected one")
-                    }
-                    (n, true, false, _) => format!(
-                        "summary written · {n} action item{plural} — Tab shows the board, m the summary"
-                    ),
+                let msg = if !current {
+                    "the previous meeting's summary is written — it is on the bar"
+                } else if self.app.session.is_none() && self.app.right_pane == RightPane::Summary {
+                    "summary written"
+                } else {
+                    "summary written — m shows it"
                 };
-                self.app.flash(msg, false);
+                self.app.flash(msg.into(), false);
             }
             SuggestEvent::Failed {
                 meeting_id,
@@ -1077,206 +801,10 @@ impl Loop {
                     self.app.live_stale = true;
                 }
                 self.app.push_log(format!(
-                    "⚠ could not write the summary and action items: {error}"
+                    "⚠ could not write the summary: {error}"
                 ));
             }
         }
-    }
-
-    fn on_run(&mut self, ev: RunEvent) {
-        match ev {
-            RunEvent::Started {
-                item_id,
-                branch,
-                worktree,
-                log_path,
-                resumed,
-            } => {
-                if resumed {
-                    let title = self
-                        .app
-                        .item_mut(&item_id)
-                        .map(|i| i.title.clone())
-                        .unwrap_or_default();
-                    self.app
-                        .push_log(format!("resuming the agent for \"{title}\" on {branch}"));
-                }
-                let _ = self.store.set_item_outcome(
-                    &item_id,
-                    ItemStatus::Running,
-                    &crate::store::RunOutcome {
-                        branch: Some(branch.clone()),
-                        worktree_path: Some(worktree.clone()),
-                        log_path: Some(log_path.clone()),
-                        ..Default::default()
-                    },
-                );
-                self.app
-                    .on_run_started(&item_id, branch, worktree, log_path);
-            }
-            RunEvent::Session {
-                item_id,
-                session_id,
-            } => {
-                let _ = self.store.set_item_session(&item_id, &session_id);
-                self.app.on_run_session(&item_id, session_id);
-            }
-            RunEvent::Phase { item_id, phase } => {
-                let _ = self.store.set_item_phase(&item_id, phase);
-                self.app.on_run_phase(&item_id, phase);
-            }
-            RunEvent::Activity { item_id, text } => {
-                self.app.activity.insert(item_id, text);
-                self.app.dirty = true;
-            }
-            RunEvent::Usage {
-                item_id,
-                usage,
-                ended,
-            } => {
-                self.app.on_agent_usage(&item_id, usage, ended);
-            }
-            RunEvent::Finished { item_id, outcome } => {
-                self.stops.remove(&item_id);
-                let _ = self
-                    .store
-                    .set_item_outcome(&item_id, ItemStatus::Done, &outcome);
-                self.app.on_run_ended(&item_id, ItemStatus::Done, &outcome);
-                if let Some(u) = &outcome.pr_url {
-                    self.app.flash(format!("pull request opened: {u}"), false);
-                }
-            }
-            RunEvent::Stopped { item_id, outcome } => {
-                self.stops.remove(&item_id);
-                let _ = self
-                    .store
-                    .set_item_outcome(&item_id, ItemStatus::Stopped, &outcome);
-                self.app
-                    .on_run_ended(&item_id, ItemStatus::Stopped, &outcome);
-                self.app
-                    .flash("agent stopped — Enter resumes it where it was".into(), false);
-            }
-            RunEvent::Failed { item_id, outcome } => {
-                self.stops.remove(&item_id);
-                let _ = self
-                    .store
-                    .set_item_outcome(&item_id, ItemStatus::Failed, &outcome);
-                self.app
-                    .on_run_ended(&item_id, ItemStatus::Failed, &outcome);
-                let err = outcome.error.clone().unwrap_or_else(|| "failed".into());
-                self.app.flash(
-                    format!("agent failed: {}", crate::stream_json::excerpt(&err, 120)),
-                    true,
-                );
-                self.app.push_log(format!("⚠ run failed: {err}"));
-            }
-        }
-    }
-
-    /// What the item came from, for the agent's context: its meeting's summary, or (items
-    /// from before the summary was written per meeting) its chunk's.
-    fn meeting_context_for(&self, item: &ActionItem) -> String {
-        item.chunk_id
-            .as_deref()
-            .and_then(|id| self.app.chunks.iter().find(|c| c.id == id))
-            .and_then(|c| c.summary.clone())
-            .or_else(|| {
-                item.chunk_id
-                    .as_deref()
-                    .and_then(|id| self.store.get_chunk(id).ok().flatten())
-                    .and_then(|c| c.summary)
-            })
-            .or_else(|| {
-                self.app
-                    .sessions
-                    .iter()
-                    .find(|m| m.id == item.meeting_id)
-                    .and_then(|m| m.summary.clone())
-            })
-            .unwrap_or_default()
-    }
-
-    /// Start (or resume) the run for `item`. `quiet` skips the flash — the launch-time
-    /// resume announces itself once for all of them.
-    fn start_run(&mut self, item: ActionItem, quiet: bool) {
-        let mut ctx = self.run_ctx.clone();
-        ctx.meeting_context = self.meeting_context_for(&item);
-        let _ = self.store.set_item_status(&item.id, ItemStatus::Running);
-        if let Some(i) = self.app.item_mut(&item.id) {
-            i.status = ItemStatus::Running;
-            i.error = None;
-            i.pr_url = None;
-        }
-        let resuming = item.worktree_path.is_some();
-        self.app.activity.insert(
-            item.id.clone(),
-            if resuming {
-                "resuming".into()
-            } else {
-                "creating the worktree".into()
-            },
-        );
-        if !quiet {
-            self.app.flash(
-                format!(
-                    "{}: {}",
-                    if resuming { "resuming" } else { "running" },
-                    item.title
-                ),
-                false,
-            );
-        }
-        let (stop_tx, stop_rx) = watch::channel(false);
-        self.stops.insert(item.id.clone(), stop_tx);
-        spawn_run(item, ctx, self.run_tx.clone(), stop_rx);
-        self.app.dirty = true;
-    }
-
-    fn run_selected(&mut self) {
-        let Some(item) = self.app.selected_item().cloned() else {
-            return;
-        };
-        if !item.status.runnable() {
-            let msg = match item.status {
-                ItemStatus::Running => "already running — X stops it",
-                ItemStatus::Done => "already done — o opens the pull request",
-                _ => "not runnable",
-            };
-            self.app.flash(msg.into(), true);
-            return;
-        }
-        self.start_run(item, false);
-    }
-
-    /// Ask before stopping the selected item's agent.
-    fn confirm_stop_selected(&mut self) {
-        let Some(item) = self.app.selected_item() else {
-            return;
-        };
-        if item.status != ItemStatus::Running {
-            self.app.flash("no agent is running on this item".into(), true);
-            return;
-        }
-        self.app.overlay = Some(Overlay::ConfirmStop {
-            item_id: item.id.clone(),
-        });
-        self.app.dirty = true;
-    }
-
-    fn stop_item(&mut self, item_id: &str) {
-        match self.stops.get(item_id) {
-            Some(stop) => {
-                let _ = stop.send(true);
-                self.app
-                    .activity
-                    .insert(item_id.to_string(), "stopping…".into());
-                self.app.flash("stopping the agent…".into(), false);
-            }
-            None => self
-                .app
-                .flash("that agent is already finishing up".into(), true),
-        }
-        self.app.dirty = true;
     }
 
     // ----- the question session -----
@@ -1331,7 +859,7 @@ impl Loop {
         }
         let meeting_id = ctx.meeting_id.clone();
         let launch = ask::Launch {
-            claude_bin: self.run_ctx.claude_bin.clone(),
+            claude_bin: self.claude_bin.clone(),
             model: self.ask_model.clone(),
             effort: self.ask_effort.clone(),
             ctx,
@@ -1461,32 +989,17 @@ impl Loop {
     // ----- settings -----
 
     /// Resolve every feature's model and effort from the settings and this launch's flags,
-    /// and hand them to the workers: the lookup reads its config before every call, the
-    /// suggester and the runner take theirs at each start, the question session at `a`.
+    /// and hand them on: the suggester takes its at each start, the question session at `a`.
     /// Shared by startup and every change in the modal, so nothing can reach one and miss
     /// the other.
     fn apply_settings(&mut self) {
         let s = &self.app.settings;
         let o = &self.app.overrides;
-        let eff = |f: Feature, field: Field, fallback: Option<&str>| {
-            settings::effective(s, f, field, o.get(f, field), fallback)
-        };
-        let lookup_model = eff(Feature::Lookup, Field::Model, None);
-        let lookup_effort = eff(Feature::Lookup, Field::Effort, None);
-        self.lookup_cfg.send_modify(|c| {
-            c.model = lookup_model;
-            c.effort = lookup_effort;
-        });
-        self.suggest_cfg.model = eff(Feature::Suggest, Field::Model, None);
-        self.suggest_cfg.effort = eff(Feature::Suggest, Field::Effort, None);
-        self.run_ctx.agent_model = eff(
-            Feature::Agent,
-            Field::Model,
-            self.config_agent_model.as_deref(),
-        );
-        self.run_ctx.agent_effort = eff(Feature::Agent, Field::Effort, None);
-        self.ask_model = eff(Feature::Ask, Field::Model, None);
-        self.ask_effort = eff(Feature::Ask, Field::Effort, None);
+        let eff = |f: Feature, field: Field| settings::effective(s, f, field, o.get(f, field));
+        self.suggest_cfg.model = eff(Feature::Suggest, Field::Model);
+        self.suggest_cfg.effort = eff(Feature::Suggest, Field::Effort);
+        self.ask_model = eff(Feature::Ask, Field::Model);
+        self.ask_effort = eff(Feature::Ask, Field::Effort);
     }
 
     /// One line for the log: what each feature runs with right now.
@@ -1498,12 +1011,9 @@ impl Loop {
                 None => m.to_string(),
             }
         };
-        let lookup = self.lookup_cfg.borrow();
         format!(
-            "lookup {} · action items {} · agent {} · ask {}",
-            show(&lookup.model, &lookup.effort),
+            "summary {} · ask {}",
             show(&self.suggest_cfg.model, &self.suggest_cfg.effort),
-            show(&self.run_ctx.agent_model, &self.run_ctx.agent_effort),
             show(&self.ask_model, &self.ask_effort),
         )
     }
@@ -1618,27 +1128,6 @@ impl Loop {
                 return;
             }
         };
-        let rows = self.store.list_chunks(&meeting.id).unwrap_or_default();
-        let chunks = rows
-            .into_iter()
-            .map(|c| crate::app::ChunkView {
-                id: c.id,
-                idx: c.idx.max(0) as usize,
-                start: c.start_secs,
-                end: c.end_secs,
-                words: c.text.split_whitespace().count(),
-                state: if c.summary.is_some() {
-                    ChunkState::Done
-                } else {
-                    ChunkState::Failed("no summary".into())
-                },
-                text: c.text,
-                summary: c.summary,
-                facts: c.facts,
-                contradictions: c.contradictions,
-                questions: c.questions,
-            })
-            .collect();
         // Its write-up, for the Summary pane, the first time it is opened.
         if !self.app.notes.contains_key(&meeting.id) {
             if let Ok(Some(notes)) = self.store.meeting_notes(&meeting.id) {
@@ -1649,7 +1138,6 @@ impl Loop {
         self.app.enter_session(SessionView {
             meeting,
             transcript,
-            chunks,
         });
         self.app.flash(
             format!("session {label} — ←/→ step, a ask Claude about it, Esc back to live"),
@@ -1674,70 +1162,6 @@ impl Loop {
         self.view_session(next as usize);
     }
 
-    fn open_selected(&mut self) {
-        let Some(item) = self.app.selected_item() else {
-            return;
-        };
-        let Some(url) = item.pr_url.clone() else {
-            self.app
-                .flash("no pull request for this item yet".into(), true);
-            return;
-        };
-        let opener = if cfg!(target_os = "macos") {
-            "open"
-        } else {
-            "xdg-open"
-        };
-        match std::process::Command::new(opener).arg(&url).spawn() {
-            Ok(_) => self.app.flash(format!("opened {url}"), false),
-            Err(e) => self
-                .app
-                .flash(format!("could not open the browser: {e}"), true),
-        }
-    }
-
-    fn open_log(&mut self) {
-        let Some(item) = self.app.selected_item() else {
-            return;
-        };
-        let Some(path) = item.log_path.clone() else {
-            self.app
-                .flash("no agent log for this item yet".into(), true);
-            return;
-        };
-        let id = item.id.clone();
-        let lines = read_tail(&path, 2000);
-        self.app.overlay = Some(Overlay::Log {
-            item_id: id,
-            lines,
-            scroll: 0,
-            follow: true,
-        });
-        self.app.dirty = true;
-    }
-
-    fn refresh_log_overlay(&mut self) {
-        let Some(Overlay::Log { item_id, .. }) = &self.app.overlay else {
-            return;
-        };
-        let Some(path) = self
-            .app
-            .items
-            .iter()
-            .find(|i| &i.id == item_id)
-            .and_then(|i| i.log_path.clone())
-        else {
-            return;
-        };
-        let fresh = read_tail(&path, 2000);
-        if let Some(Overlay::Log { lines, .. }) = &mut self.app.overlay {
-            if *lines != fresh {
-                *lines = fresh;
-                self.app.dirty = true;
-            }
-        }
-    }
-
     fn add_note(&mut self, text: String) {
         let text = text.trim().to_string();
         if text.is_empty() {
@@ -1752,14 +1176,13 @@ impl Loop {
         });
     }
 
-    /// Ask before quitting when something would be cut short: the recording, running
-    /// agents, or the summary still being written (meet's call, or an engine hook —
-    /// quitting takes the engine down with it).
+    /// Ask before quitting when something would be cut short: the recording, or the
+    /// summary still being written (meet's call, or an engine hook — quitting takes the
+    /// engine down with it).
     fn request_quit(&mut self) {
-        let running = self.app.running_count();
         let live = self.app.is_live();
-        if running > 0 || live || self.app.summarizing() {
-            self.app.overlay = Some(Overlay::ConfirmQuit { running, live });
+        if live || self.app.summarizing() {
+            self.app.overlay = Some(Overlay::ConfirmQuit { live });
             self.app.dirty = true;
         } else {
             self.app.should_quit = true;
@@ -1808,8 +1231,7 @@ impl Loop {
     // ----- the mouse -----
 
     /// The mouse, the way nebula has it: a click focuses what it lands on — a pane, a tab
-    /// on the right pane, a session on the bar, a summary, an action item, a row of an
-    /// overlay, a source in the header — or closes an overlay when it lands outside it;
+    /// on the right pane, a session on the bar, a row of an overlay, a source in the header — or closes an overlay when it lands outside it;
     /// the wheel scrolls what it is over; a press on the border between two panes grabs
     /// the seam, dragging moves it, and the shares go to layout.json when the button
     /// comes up. A drag over the transcript selects its text and copies it when the button
@@ -1836,7 +1258,6 @@ impl Loop {
         }
         self.app.pointer_shape = match hover {
             Some(Splitter::Columns) => PointerShape::ColResize,
-            Some(_) => PointerShape::RowResize,
             None => PointerShape::Default,
         };
         match m.kind {
@@ -1849,7 +1270,7 @@ impl Loop {
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 if !self.app.drag_selection_to(x, y) {
-                    self.app.drag_splitter_to(x, y);
+                    self.app.drag_splitter_to(x);
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
@@ -1867,7 +1288,7 @@ impl Loop {
 
     fn click(&mut self, x: u16, y: u16, target: HitTarget) {
         match target {
-            HitTarget::Splitter(s) => self.app.grab_splitter(s, x, y),
+            HitTarget::Splitter(s) => self.app.grab_splitter(s, x),
             HitTarget::Source(i) => {
                 if let Some(source) = self.app.sources.get(i).cloned() {
                     self.toggle_mute(&source);
@@ -1890,11 +1311,7 @@ impl Loop {
                     self.copy(word);
                 }
             }
-            HitTarget::Summaries(None) => self.app.focus_panes(),
-            HitTarget::Summaries(Some(i)) => self.app.pick_chunk(i),
             HitTarget::RightTab(pane) => self.app.show_pane(pane),
-            HitTarget::Items(Some(row)) => self.app.select_row(row),
-            HitTarget::Items(None) | HitTarget::Detail => self.app.focus_panes(),
             HitTarget::Right => {
                 // Claude Code's pane: a click hands it the keys, as a does.
                 if self.app.right_pane == RightPane::Ask && self.app.term_running() {
@@ -1961,25 +1378,13 @@ impl Loop {
         self.app.dirty = true;
     }
 
-    /// The wheel: `delta` lines, negative up — the transcript, the right pane and the
-    /// agent log scroll; the summaries, the action items, the session list and the
-    /// settings step their selection.
+    /// The wheel: `delta` lines, negative up — the transcript and the right pane scroll;
+    /// the session list and the settings step their selection.
     fn wheel(&mut self, target: HitTarget, delta: i32) {
-        let step = |v: usize| {
-            if delta < 0 {
-                v.saturating_sub(delta.unsigned_abs() as usize)
-            } else {
-                v + delta as usize
-            }
-        };
         let up = delta < 0;
         match target {
             HitTarget::Overlay(_) | HitTarget::Outside if self.app.overlay.is_some() => {
                 match &mut self.app.overlay {
-                    Some(Overlay::Log { scroll, follow, .. }) => {
-                        *scroll = step(*scroll);
-                        *follow = false;
-                    }
                     Some(Overlay::Sessions { cursor }) => {
                         let max = self.app.sessions.len().saturating_sub(1);
                         *cursor = if up { cursor.saturating_sub(1) } else { (*cursor + 1).min(max) };
@@ -1992,17 +1397,13 @@ impl Loop {
                 }
             }
             HitTarget::Transcript => self.app.scroll_transcript(delta),
-            HitTarget::Summaries(_) if up => self.app.chunk_prev(),
-            HitTarget::Summaries(_) => self.app.chunk_next(),
-            HitTarget::Items(_) if up => self.app.select_prev(),
-            HitTarget::Items(_) => self.app.select_next(),
-            HitTarget::Detail | HitTarget::Right => self.app.scroll_right_pane(delta),
+            HitTarget::Right => self.app.scroll_right_pane(delta),
             _ => {}
         }
         self.app.dirty = true;
     }
 
-    /// The seams as dragged, to layout.json, for the next launch.
+    /// The seam as dragged, to layout.json, for the next launch.
     fn save_layout(&mut self) {
         if let Err(e) = self.app.layout.save() {
             self.app.push_log(format!(
@@ -2047,12 +1448,6 @@ impl Loop {
                     KeyCode::Char('d') | KeyCode::Char('D') if live => self.confirm_discard(),
                     _ => self.app.overlay = None,
                 },
-                Overlay::ConfirmStop { item_id } => {
-                    self.app.overlay = None;
-                    if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter) {
-                        self.stop_item(&item_id);
-                    }
-                }
                 Overlay::ConfirmEnd => {
                     self.app.overlay = None;
                     if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter) {
@@ -2087,58 +1482,6 @@ impl Loop {
                     _ if ctrl_c => self.request_quit(),
                     _ => {}
                 },
-                Overlay::Log {
-                    item_id,
-                    lines,
-                    scroll,
-                    ..
-                } => match key.code {
-                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('l') => {
-                        self.app.overlay = None
-                    }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        self.app.overlay = Some(Overlay::Log {
-                            item_id,
-                            lines,
-                            scroll: scroll.saturating_sub(1),
-                            follow: false,
-                        })
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        self.app.overlay = Some(Overlay::Log {
-                            item_id,
-                            lines,
-                            scroll: scroll + 1,
-                            follow: false,
-                        })
-                    }
-                    KeyCode::PageUp => {
-                        self.app.overlay = Some(Overlay::Log {
-                            item_id,
-                            lines,
-                            scroll: scroll.saturating_sub(20),
-                            follow: false,
-                        })
-                    }
-                    KeyCode::PageDown => {
-                        self.app.overlay = Some(Overlay::Log {
-                            item_id,
-                            lines,
-                            scroll: scroll + 20,
-                            follow: false,
-                        })
-                    }
-                    KeyCode::Char('G') => {
-                        self.app.overlay = Some(Overlay::Log {
-                            item_id,
-                            lines,
-                            scroll,
-                            follow: true,
-                        })
-                    }
-                    _ if ctrl_c => self.request_quit(),
-                    _ => {}
-                },
                 Overlay::Settings { cursor, .. } => match key.code {
                     KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char(',') => {
                         self.app.overlay = None
@@ -2151,7 +1494,7 @@ impl Loop {
                         self.settings_cycle(cursor, 1)
                     }
                     KeyCode::Left | KeyCode::Char('h') => self.settings_cycle(cursor, -1),
-                    KeyCode::Char(c @ '1'..='4') => {
+                    KeyCode::Char(c @ '1'..='2') => {
                         let n = c as usize - '1' as usize;
                         self.settings_move(settings::first_row_of(Feature::ALL[n]))
                     }
@@ -2207,34 +1550,21 @@ impl Loop {
             KeyCode::Char('q') | KeyCode::Esc => self.request_quit(),
             KeyCode::Char('c') if ctrl_c => self.request_quit(),
             KeyCode::Char('j') | KeyCode::Down => match self.app.right_pane {
-                RightPane::Related => self.app.chunk_next(),
-                RightPane::Items => self.app.select_next(),
                 RightPane::Summary => self.app.summary_scroll += 1,
                 RightPane::Ask => {}
             },
             KeyCode::Char('k') | KeyCode::Up => match self.app.right_pane {
-                RightPane::Related => self.app.chunk_prev(),
-                RightPane::Items => self.app.select_prev(),
                 RightPane::Summary => {
                     self.app.summary_scroll = self.app.summary_scroll.saturating_sub(1)
                 }
                 RightPane::Ask => {}
             },
             KeyCode::Char('m') => self.app.show_summary(),
-            KeyCode::Enter => self.run_selected(),
             KeyCode::Char('r') => self.start_recording(),
             KeyCode::Char('x') => self.confirm_end(),
             KeyCode::Char('D') => self.confirm_discard(),
             KeyCode::Tab => self.app.toggle_pane(),
             KeyCode::BackTab => self.app.toggle_pane_back(),
-            KeyCode::Char('X') => self.confirm_stop_selected(),
-            KeyCode::Char('d') => {
-                if let Some(id) = self.app.dismiss_selected() {
-                    let _ = self.store.set_item_status(&id, ItemStatus::Dismissed);
-                }
-            }
-            KeyCode::Char('l') => self.open_log(),
-            KeyCode::Char('o') => self.open_selected(),
             KeyCode::Char('a') => self.ask(),
             KeyCode::Char('S') => self.open_sessions(),
             KeyCode::Left => self.step_session(-1),
@@ -2246,13 +1576,10 @@ impl Loop {
             }
             KeyCode::Char('s') => {
                 if self.app.is_live() {
-                    if self.app.lookup_disabled {
-                        self.app.flash("lookups are off".into(), true);
-                    } else if self.app.chunker.pending_words() == 0 {
-                        self.app.flash("nothing pending to look up".into(), true);
-                    } else if let Some(chunk) = self.app.chunker.flush() {
-                        self.enqueue_chunk(chunk);
-                    }
+                    self.app.flash(
+                        "the summary is written when the recording stops — x stops it".into(),
+                        true,
+                    );
                 } else if self.app.session.is_some() {
                     self.app
                         .flash("Esc back to the live meeting first".into(), true);
@@ -2261,7 +1588,7 @@ impl Loop {
                         .flash("nothing recorded yet — r starts the recording".into(), true);
                 } else if self.app.wrap_up == WrapUp::Writing {
                     self.app.flash(
-                        "the summary and action items are being written — m shows the progress".into(),
+                        "the summary is being written — m shows the progress".into(),
                         true,
                     );
                 } else if self.app.suggest_disabled {
@@ -2270,7 +1597,7 @@ impl Loop {
                 } else {
                     self.app.wrap_up = WrapUp::NotYet;
                     self.app
-                        .flash("writing the summary and action items again…".into(), false);
+                        .flash("writing the summary again…".into(), false);
                     self.wrap_up();
                 }
             }
@@ -2285,23 +1612,14 @@ impl Loop {
             KeyCode::PageDown | KeyCode::Char('J') => self.app.scroll_transcript(10),
             KeyCode::Char('G') => {
                 self.app.transcript_scroll = None;
-                self.app.follow_chunks();
             }
             KeyCode::Char('[') => match self.app.right_pane {
-                RightPane::Items => {
-                    self.app.detail_scroll = self.app.detail_scroll.saturating_sub(3)
-                }
-                RightPane::Related => {
-                    self.app.related_scroll = self.app.related_scroll.saturating_sub(3)
-                }
                 RightPane::Summary => {
                     self.app.summary_scroll = self.app.summary_scroll.saturating_sub(3)
                 }
                 RightPane::Ask => {}
             },
             KeyCode::Char(']') => match self.app.right_pane {
-                RightPane::Items => self.app.detail_scroll += 3,
-                RightPane::Related => self.app.related_scroll += 3,
                 RightPane::Summary => self.app.summary_scroll += 3,
                 RightPane::Ask => {}
             },
@@ -2310,17 +1628,6 @@ impl Loop {
             _ => {}
         }
         self.app.dirty = true;
-    }
-}
-
-fn read_tail(path: &str, max_lines: usize) -> Vec<String> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => {
-            let lines: Vec<String> = text.lines().map(str::to_string).collect();
-            let skip = lines.len().saturating_sub(max_lines);
-            lines.into_iter().skip(skip).collect()
-        }
-        Err(e) => vec![format!("(no log yet: {e})")],
     }
 }
 

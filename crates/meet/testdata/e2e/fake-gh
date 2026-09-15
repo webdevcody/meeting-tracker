@@ -1,7 +1,0 @@
-#!/bin/bash
-# Stand-in for `gh pr create`: prints a pull request URL with an incrementing number.
-echo "GH ARGS: $*" >> "${FAKE_CLAUDE_LOG:-/dev/null}"
-counter="${FAKE_GH_COUNTER:-/tmp/fake-gh-counter}"
-n=$(( $(cat "$counter" 2>/dev/null || echo 0) + 1 ))
-echo "$n" > "$counter"
-echo "https://github.com/example/todo/pull/$n"

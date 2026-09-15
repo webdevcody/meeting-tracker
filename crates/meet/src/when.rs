@@ -1,5 +1,17 @@
-//! Wall-clock formatting for the session list: local `YYYY-MM-DD HH:MM` from unix seconds,
-//! and durations as people say them. libc's `localtime_r` keeps this dependency-free.
+//! Time formatting: the recording clock (`mm:ss`), and for the session list local
+//! `YYYY-MM-DD HH:MM` from unix seconds and durations as people say them. libc's
+//! `localtime_r` keeps this dependency-free.
+
+/// `mm:ss`, or `h:mm:ss` from an hour on: the recording clock, and when a transcript line
+/// was said.
+pub fn clock(secs: f64) -> String {
+    let s = secs.max(0.0) as u64;
+    if s >= 3600 {
+        format!("{}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+    } else {
+        format!("{:02}:{:02}", s / 60, s % 60)
+    }
+}
 
 pub fn local_datetime(secs: i64) -> String {
     let (y, mo, d, h, mi) = local_parts(secs);
@@ -62,5 +74,8 @@ mod tests {
         assert_eq!(human_duration(2520), "42m");
         assert_eq!(human_duration(3900), "1h 05m");
         assert_eq!(human_duration(-5), "0s");
+        assert_eq!(clock(65.0), "01:05");
+        assert_eq!(clock(3661.0), "1:01:01");
+        assert_eq!(clock(-1.0), "00:00");
     }
 }

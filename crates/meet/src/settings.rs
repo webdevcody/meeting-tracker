@@ -1,13 +1,12 @@
 //! The TUI's own settings: which Claude model and `--effort` each feature runs with — the
-//! live lookup, the action-item writer, the implementing agent and the question session.
-//! Edited in the settings modal (`,` in the TUI), kept in `<data dir>/settings.json` per
-//! user (never inside the repository, never in the engine's `meet.json`), and applied to
-//! the next call of that feature the moment a value changes.
+//! summary writer and the question session. Edited in the settings modal
+//! (`,` in the TUI), kept in `<data dir>/settings.json` per user (never inside the
+//! repository, never in the engine's `meet.json`), and applied to the next call of that
+//! feature the moment a value changes.
 //!
-//! Where a value comes from, first match wins: the launch's CLI flag (`--lookup-model` …,
+//! Where a value comes from, first match wins: the launch's CLI flag (`--suggest-model` …,
 //! for this run only), the settings file, then the built-in default. `"default"` means
-//! "claude's own" — no `--model` / `--effort` is passed — except for the agent's model,
-//! which then falls through to `agent.model` in `meet.json`.
+//! "claude's own" — no `--model` / `--effort` is passed.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -44,30 +43,19 @@ pub const EFFORTS: &[&str] = &[DEFAULT, "low", "medium", "high", "xhigh", "max"]
 /// A feature that calls Claude.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Feature {
-    /// The live lookup that fills the Related pane, once per chunk.
-    Lookup,
-    /// The action-item writer that runs when the recording stops.
+    /// The summary writer that runs when the recording stops.
     Suggest,
-    /// The implementing agent, one per action item.
-    Agent,
     /// The question session (`a`, `meet ask`).
     Ask,
 }
 
 impl Feature {
-    pub const ALL: [Feature; 4] = [
-        Feature::Lookup,
-        Feature::Suggest,
-        Feature::Agent,
-        Feature::Ask,
-    ];
+    pub const ALL: [Feature; 2] = [Feature::Suggest, Feature::Ask];
 
     /// The tab / section title.
     pub fn title(self) -> &'static str {
         match self {
-            Feature::Lookup => "Lookup",
-            Feature::Suggest => "Action items",
-            Feature::Agent => "Agent",
+            Feature::Suggest => "Summary",
             Feature::Ask => "Ask",
         }
     }
@@ -75,14 +63,8 @@ impl Feature {
     /// One line on what the feature is, for the modal (fits its width).
     pub fn blurb(self) -> &'static str {
         match self {
-            Feature::Lookup => {
-                "the live lookup: fills the Related pane, one small call per minute of talk"
-            }
             Feature::Suggest => {
-                "the action-item writer: one call over the transcript when the recording stops"
-            }
-            Feature::Agent => {
-                "the implementing agent: one Claude Code run per item, ending in a pull request"
+                "the meeting summary: one call over the whole transcript when the recording stops"
             }
             Feature::Ask => "the question session: Claude Code in the right pane (a) and `meet ask`",
         }
@@ -91,9 +73,7 @@ impl Feature {
     /// When a changed value takes effect.
     pub fn applies_to(self) -> &'static str {
         match self {
-            Feature::Lookup => "the next lookup",
-            Feature::Suggest => "the next action-item run",
-            Feature::Agent => "agents started from now on",
+            Feature::Suggest => "the next summary",
             Feature::Ask => "the next question session",
         }
     }
@@ -101,9 +81,7 @@ impl Feature {
     /// The JSON key in the settings file and the CLI flag prefix.
     pub fn key(self) -> &'static str {
         match self {
-            Feature::Lookup => "lookup",
             Feature::Suggest => "suggest",
-            Feature::Agent => "agent",
             Feature::Ask => "ask",
         }
     }
@@ -146,18 +124,14 @@ impl Field {
 }
 
 /// The settings in the order the modal lists them: each feature's model, then its effort.
-pub const ROWS: [(Feature, Field); 8] = [
-    (Feature::Lookup, Field::Model),
-    (Feature::Lookup, Field::Effort),
+pub const ROWS: [(Feature, Field); 4] = [
     (Feature::Suggest, Field::Model),
     (Feature::Suggest, Field::Effort),
-    (Feature::Agent, Field::Model),
-    (Feature::Agent, Field::Effort),
     (Feature::Ask, Field::Model),
     (Feature::Ask, Field::Effort),
 ];
 
-/// The CLI flag that overrides a setting for one launch: `--lookup-model`, `--ask-effort`.
+/// The CLI flag that overrides a setting for one launch: `--suggest-model`, `--ask-effort`.
 pub fn flag_name(feature: Feature, field: Field) -> String {
     format!("--{}-{}", feature.key(), field.label())
 }
@@ -188,12 +162,12 @@ pub fn rows() -> Vec<Row> {
     out
 }
 
-/// The first row of a feature in [`ROWS`], for the `1`–`4` jump.
+/// The first row of a feature in [`ROWS`], for the `1`–`2` jump.
 pub fn first_row_of(feature: Feature) -> usize {
     ROWS.iter().position(|(f, _)| *f == feature).unwrap_or(0)
 }
 
-/// The values passed on the command line this launch (`--lookup-model haiku`): they win
+/// The values passed on the command line this launch (`--suggest-model haiku`): they win
 /// over the file until `meet` restarts, and the modal says so beside the row.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Overrides(HashMap<(Feature, Field), String>);
@@ -250,9 +224,7 @@ impl Pair {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    pub lookup: Pair,
     pub suggest: Pair,
-    pub agent: Pair,
     pub ask: Pair,
 }
 
@@ -260,9 +232,7 @@ impl Default for Settings {
     /// What `meet` ran with before there was a settings file.
     fn default() -> Self {
         Self {
-            lookup: Pair::new("sonnet", "low"),
             suggest: Pair::new("sonnet", DEFAULT),
-            agent: Pair::new(DEFAULT, DEFAULT),
             ask: Pair::new("sonnet", DEFAULT),
         }
     }
@@ -302,18 +272,14 @@ impl Settings {
 
     pub fn pair(&self, feature: Feature) -> &Pair {
         match feature {
-            Feature::Lookup => &self.lookup,
             Feature::Suggest => &self.suggest,
-            Feature::Agent => &self.agent,
             Feature::Ask => &self.ask,
         }
     }
 
     fn pair_mut(&mut self, feature: Feature) -> &mut Pair {
         match feature {
-            Feature::Lookup => &mut self.lookup,
             Feature::Suggest => &mut self.suggest,
-            Feature::Agent => &mut self.agent,
             Feature::Ask => &mut self.ask,
         }
     }
@@ -395,21 +361,17 @@ impl Settings {
 }
 
 /// What a feature actually runs with this launch: the CLI flag when one was passed, else
-/// the setting; `None` is claude's own. `fallback` is what a `"default"` setting falls
-/// through to (the agent's `meet.json` model).
+/// the setting; `None` is claude's own.
 pub fn effective(
     settings: &Settings,
     feature: Feature,
     field: Field,
     cli: Option<&str>,
-    fallback: Option<&str>,
 ) -> Option<String> {
-    if let Some(c) = cli {
-        return as_flag(c);
+    match cli {
+        Some(c) => as_flag(c),
+        None => settings.flag(feature, field),
     }
-    settings
-        .flag(feature, field)
-        .or_else(|| fallback.and_then(as_flag))
 }
 
 #[cfg(test)]
@@ -419,12 +381,10 @@ mod tests {
     #[test]
     fn defaults_match_what_meet_ran_with_and_default_means_no_flag() {
         let s = Settings::default();
-        assert_eq!(s.flag(Feature::Lookup, Field::Model).as_deref(), Some("sonnet"));
-        assert_eq!(s.flag(Feature::Lookup, Field::Effort).as_deref(), Some("low"));
+        assert_eq!(s.flag(Feature::Suggest, Field::Model).as_deref(), Some("sonnet"));
         assert_eq!(s.flag(Feature::Suggest, Field::Effort), None);
-        assert_eq!(s.flag(Feature::Agent, Field::Model), None);
         assert_eq!(s.flag(Feature::Ask, Field::Model).as_deref(), Some("sonnet"));
-        assert_eq!(s.get(Feature::Agent, Field::Effort), DEFAULT);
+        assert_eq!(s.get(Feature::Ask, Field::Effort), DEFAULT);
         assert_eq!(normalize("  "), DEFAULT);
         assert_eq!(normalize(" opus "), "opus");
         assert_eq!(as_flag("default"), None);
@@ -433,16 +393,18 @@ mod tests {
     #[test]
     fn cycling_wraps_and_an_unknown_value_steps_to_the_first_choice() {
         let mut s = Settings::default();
-        s.cycle(Feature::Lookup, Field::Effort, 1);
-        assert_eq!(s.get(Feature::Lookup, Field::Effort), "medium");
-        s.cycle(Feature::Lookup, Field::Effort, -2);
-        assert_eq!(s.get(Feature::Lookup, Field::Effort), DEFAULT);
-        s.cycle(Feature::Lookup, Field::Effort, -1);
-        assert_eq!(s.get(Feature::Lookup, Field::Effort), "max", "wraps backwards");
-        s.set(Feature::Agent, Field::Model, "claude-opus-4-1");
-        assert_eq!(s.get(Feature::Agent, Field::Model), "claude-opus-4-1", "kept as typed");
-        s.cycle(Feature::Agent, Field::Model, 1);
-        assert_eq!(s.get(Feature::Agent, Field::Model), MODELS[0]);
+        s.cycle(Feature::Suggest, Field::Effort, 1);
+        assert_eq!(s.get(Feature::Suggest, Field::Effort), "low");
+        s.cycle(Feature::Suggest, Field::Effort, 1);
+        assert_eq!(s.get(Feature::Suggest, Field::Effort), "medium");
+        s.cycle(Feature::Suggest, Field::Effort, -2);
+        assert_eq!(s.get(Feature::Suggest, Field::Effort), DEFAULT);
+        s.cycle(Feature::Suggest, Field::Effort, -1);
+        assert_eq!(s.get(Feature::Suggest, Field::Effort), "max", "wraps backwards");
+        s.set(Feature::Ask, Field::Model, "claude-opus-4-1");
+        assert_eq!(s.get(Feature::Ask, Field::Model), "claude-opus-4-1", "kept as typed");
+        s.cycle(Feature::Ask, Field::Model, 1);
+        assert_eq!(s.get(Feature::Ask, Field::Model), MODELS[0]);
         s.reset();
         assert_eq!(s, Settings::default());
     }
@@ -453,20 +415,25 @@ mod tests {
         let path = dir.path().join("deep").join(FILE);
         assert_eq!(Settings::load_from(&path).unwrap(), Settings::default());
         let mut s = Settings::default();
-        s.set(Feature::Agent, Field::Model, "opus");
-        s.set(Feature::Agent, Field::Effort, "xhigh");
+        s.set(Feature::Ask, Field::Model, "opus");
+        s.set(Feature::Ask, Field::Effort, "xhigh");
         s.save_to(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("\"agent\": {"), "{text}");
+        assert!(text.contains("\"ask\": {"), "{text}");
         assert!(text.ends_with('\n'));
         assert!(!dir.path().join("deep").join("settings.json.tmp").exists());
         assert_eq!(Settings::load_from(&path).unwrap(), s);
 
-        std::fs::write(&path, r#"{"lookup": {"model": " haiku ", "effort": ""}, "future": 1}"#)
-            .unwrap();
+        // A file from an older meet still carries the lookup's and the agent's pairs: they
+        // are ignored.
+        std::fs::write(
+            &path,
+            r#"{"suggest": {"model": " haiku ", "effort": ""}, "lookup": {"model": "opus", "effort": "low"}, "agent": {"model": "opus", "effort": "max"}, "future": 1}"#,
+        )
+        .unwrap();
         let s = Settings::load_from(&path).unwrap();
-        assert_eq!(s.get(Feature::Lookup, Field::Model), "haiku");
-        assert_eq!(s.get(Feature::Lookup, Field::Effort), DEFAULT);
+        assert_eq!(s.get(Feature::Suggest, Field::Model), "haiku");
+        assert_eq!(s.get(Feature::Suggest, Field::Effort), DEFAULT);
         assert_eq!(s.ask, Settings::default().ask, "missing keys take their default");
         std::fs::write(&path, "{").unwrap();
         assert!(Settings::load_from(&path).is_err());
@@ -475,45 +442,42 @@ mod tests {
     #[test]
     fn the_row_map_groups_by_feature_and_overrides_drop_blanks() {
         let rows = rows();
-        assert_eq!(rows[0], Row::Header(Feature::Lookup));
+        assert_eq!(rows[0], Row::Header(Feature::Suggest));
         assert_eq!(rows[1], Row::Setting(0));
         assert_eq!(rows[2], Row::Setting(1));
         assert_eq!(rows[3], Row::Blank);
-        assert_eq!(rows[4], Row::Header(Feature::Suggest));
-        assert_eq!(rows.len(), 8 + 4 + 3);
-        assert_eq!(first_row_of(Feature::Agent), 4);
+        assert_eq!(rows[4], Row::Header(Feature::Ask));
+        assert_eq!(rows.len(), 4 + 2 + 1);
+        assert_eq!(first_row_of(Feature::Ask), 2);
         assert_eq!(flag_name(Feature::Ask, Field::Effort), "--ask-effort");
         let mut o = Overrides::default();
-        o.set(Feature::Lookup, Field::Model, Some(" haiku ".into()));
+        o.set(Feature::Suggest, Field::Model, Some(" haiku ".into()));
         o.set(Feature::Ask, Field::Model, Some("  ".into()));
         o.set(Feature::Ask, Field::Effort, None);
-        assert_eq!(o.get(Feature::Lookup, Field::Model), Some("haiku"));
+        assert_eq!(o.get(Feature::Suggest, Field::Model), Some("haiku"));
         assert_eq!(o.get(Feature::Ask, Field::Model), None);
         assert_eq!(o.get(Feature::Ask, Field::Effort), None);
     }
 
     #[test]
-    fn a_cli_flag_wins_then_the_setting_then_the_fallback() {
+    fn a_cli_flag_wins_over_the_setting() {
         let mut s = Settings::default();
         assert_eq!(
-            effective(&s, Feature::Agent, Field::Model, Some("haiku"), Some("opus")).as_deref(),
+            effective(&s, Feature::Ask, Field::Model, Some("haiku")).as_deref(),
             Some("haiku")
         );
         assert_eq!(
-            effective(&s, Feature::Agent, Field::Model, Some("default"), Some("opus")),
+            effective(&s, Feature::Ask, Field::Model, Some("default")),
             None,
             "an explicit default on the command line is claude's own"
         );
         assert_eq!(
-            effective(&s, Feature::Agent, Field::Model, None, Some("opus")).as_deref(),
-            Some("opus"),
-            "a default setting falls through to meet.json"
+            effective(&s, Feature::Ask, Field::Model, None).as_deref(),
+            Some("sonnet"),
+            "no flag: the setting"
         );
-        s.set(Feature::Agent, Field::Model, "sonnet");
-        assert_eq!(
-            effective(&s, Feature::Agent, Field::Model, None, Some("opus")).as_deref(),
-            Some("sonnet")
-        );
-        assert_eq!(effective(&s, Feature::Ask, Field::Effort, None, None), None);
+        s.set(Feature::Ask, Field::Model, "default");
+        assert_eq!(effective(&s, Feature::Ask, Field::Model, None), None);
+        assert_eq!(effective(&s, Feature::Ask, Field::Effort, None), None);
     }
 }

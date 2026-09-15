@@ -129,11 +129,6 @@ struct Init: ParsableCommand {
           "hooks": {
             "onDone": \(hooksValue),
             "env": {}
-          },
-
-          "agent": {
-            "model": "default",
-            "onDone": ""
           }
         }
 
@@ -151,8 +146,7 @@ struct Init: ParsableCommand {
         if let hookNote { log(hookNote) }
         print("")
         print("Edit summary.prompt / summary.systemPrompt to change what Claude writes; outputDir / summary.dir")
-        print("are relative to the config file. agent.onDone is one more instruction each meet agent gets when")
-        print("it is about to finish (e.g. post a summary to a GitHub issue with gh). Check the result with:")
+        print("are relative to the config file. Check the result with:")
         print("  meet record --show-config" + (path != nil && !global ? " --config \(target)" : ""))
         if !global, path == nil {
             print("Then run `meet` from this directory (or any subdirectory) to record.")

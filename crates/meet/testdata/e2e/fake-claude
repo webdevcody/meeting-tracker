@@ -1,12 +1,6 @@
 #!/bin/bash
 # A stand-in for `claude` that lets the meet TUI be driven end to end without spending money.
-#   lookup (--json-schema with "facts"): answers with a summary and one fact, one
-#     contradiction and one question per chunk
-#   suggester (--json-schema with "items"): answers with a summary and two action items
-#   agent (stream-json, no --resume): announces a session, then works "forever" (sleeps)
-#     so the run can be stopped (X) or interrupted (quit) — unless FAKE_AGENT_FAST=1,
-#     in which case it commits and finishes like the resumed agent does.
-#   agent (--resume <sid>): commits a file, writes the PR files, finishes.
+#   summary writer (--json-schema): answers with the meeting's summary and write-up
 #   question session (no -p, --append-system-prompt-file): echoes each typed line back.
 # Every invocation is appended to $FAKE_CLAUDE_LOG so the test can assert on the args.
 echo "ARGS: $*" >> "${FAKE_CLAUDE_LOG:-/dev/null}"
@@ -34,54 +28,17 @@ prompt=$(cat)
 echo "PROMPT_HEAD: $(echo "$prompt" | head -c 200 | tr '\n' ' ')" >> "${FAKE_CLAUDE_LOG:-/dev/null}"
 
 if has --json-schema; then
-  schema=$(argval --json-schema)
-  if [[ "$schema" == *'"facts"'* ]]; then
-    # The live lookup. Count previous lookups (the schema sits on each ARGS line).
-    n=$(grep -cF '"facts":{"type":"array"' "${FAKE_CLAUDE_LOG:-/dev/null}" 2>/dev/null || echo 1)
-    cat <<EOF
-{"type":"result","subtype":"success","is_error":false,"result":"ok","structured_output":{"summary":"Chunk $n: the speaker wants change number $n shipped.","facts":[{"text":"Fact $n: README.md starts with '# todo'.","where":"README.md:1"}],"contradictions":[{"text":"Contradiction $n: said the README has no title; it starts with '# todo'.","where":"README.md:1"}],"questions":["Question $n: should change $n ship before the README is updated?"]},"total_cost_usd":0.01,"usage":{"input_tokens":200,"cache_creation_input_tokens":0,"cache_read_input_tokens":1000,"output_tokens":80}}
-EOF
-    exit 0
-  fi
-  # The end-of-meeting suggester: a summary, the write-up and two items, numbered on from
-  # the previous call's. FAKE_SUGGEST_DELAY=secs holds the answer back (to see "writing…").
-  n=$(grep -cF '"items":{"type":"array"' "${FAKE_CLAUDE_LOG:-/dev/null}" 2>/dev/null || echo 1)
+  # The end-of-meeting summary writer: a summary and the write-up, numbered on from the
+  # previous call's. FAKE_SUGGEST_DELAY=secs holds the answer back (to see "writing…").
+  n=$(grep -cF '"notes":{"type":"string"}' "${FAKE_CLAUDE_LOG:-/dev/null}" 2>/dev/null || echo 1)
   a=$((2 * n - 1)); b=$((2 * n))
   [ -n "${FAKE_SUGGEST_DELAY:-}" ] && sleep "$FAKE_SUGGEST_DELAY"
-  notes="## Summary\nFake meeting $n: the speaker wants changes $a and $b shipped.\n\n## Key points\n- They talked about change $a.\n- Then about change $b.\n\n## Decisions\n- Ship changes $a and $b.\n\n## Open questions\n- Whether the README needs a title first.\n\n## Action items\n- Fake change $a\n- Fake change $b"
+  notes="## Summary\nFake meeting $n: the speaker wants changes $a and $b shipped.\n\n## Key points\n- They talked about change $a.\n- Then about change $b.\n\n## Decisions\n- Ship changes $a and $b.\n\n## Open questions\n- Whether the README needs a title first."
   cat <<EOF
-{"type":"result","subtype":"success","is_error":false,"result":"ok","structured_output":{"summary":"Meeting $n: the speaker wants changes $a and $b shipped.","notes":"$notes","items":[{"title":"Fake change $a","prompt":"I want fake change $a: add a file fake-$a.txt with the text 'fake $a'.","why":"they said fake change $a"},{"title":"Fake change $b","prompt":"I want fake change $b: add a file fake-$b.txt with the text 'fake $b'.","why":"they said fake change $b"}]},"total_cost_usd":0.05,"usage":{"input_tokens":3000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":400}}
+{"type":"result","subtype":"success","is_error":false,"result":"ok","structured_output":{"summary":"Meeting $n: the speaker wants changes $a and $b shipped.","notes":"$notes"},"total_cost_usd":0.05,"usage":{"input_tokens":3000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":400}}
 EOF
   exit 0
 fi
 
-sid=$(argval --resume)
-resumed=1
-if [ -z "$sid" ]; then
-  sid="fake-session-$$"
-  resumed=0
-fi
-echo "{\"type\":\"system\",\"subtype\":\"init\",\"cwd\":\"$PWD\",\"session_id\":\"$sid\",\"tools\":[\"Bash\"]}"
-
-finish() {
-  title_file=$(echo "$prompt" | grep -o '/[^ ]*pr-title.txt' | head -1)
-  body_file=$(echo "$prompt" | grep -o '/[^ ]*pr-body.md' | head -1)
-  echo '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"git commit"}}]}}'
-  echo "fake work ($resumed)" > fake-work.txt
-  git add -A >/dev/null 2>&1
-  git -c user.email=f@f -c user.name=fake commit -q -m "Add fake work" >/dev/null 2>&1
-  [ -n "$title_file" ] && echo "Fake work landed" > "$title_file"
-  [ -n "$body_file" ] && printf '## Summary\n\nFake work, resumed=%s. This body is long enough to count as written by the agent.\n' "$resumed" > "$body_file"
-  echo '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Committed the fake work."}]}}'
-  echo '{"type":"result","subtype":"success","is_error":false,"result":"Committed the fake work.","total_cost_usd":0.01,"duration_ms":1200,"usage":{"input_tokens":50,"cache_creation_input_tokens":0,"cache_read_input_tokens":5000,"output_tokens":120}}'
-  exit 0
-}
-
-if [ "$resumed" = 1 ] || [ "${FAKE_AGENT_FAST:-0}" = 1 ]; then
-  finish
-fi
-
-# A fresh agent: look busy until stopped or killed.
-echo '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t0","name":"Read","input":{"file_path":"README.md"}}]}}'
-trap 'echo "{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"result\":\"terminated\"}"; exit 143' TERM
-for i in $(seq 1 600); do sleep 0.2; done
+echo '{"type":"result","subtype":"error_during_execution","is_error":true,"result":"fake claude: meet makes no other headless call"}'
+exit 1

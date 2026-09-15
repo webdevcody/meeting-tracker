@@ -10,7 +10,7 @@ struct MeetingTracker: AsyncParsableCommand {
         abstract: "Record microphone and/or system audio, transcribe on-device, then run hooks.",
         discussion: """
         This is the recording engine behind `meet`: the `meet` TUI spawns `meet-rec record --json`
-        and turns the transcript into action items. Running meet-rec directly with no subcommand
+        and turns the transcript into a summary. Running meet-rec directly with no subcommand
         records a meeting (same as `meet-rec record`). Use `meet-rec init` to create a config file.
         """,
         subcommands: [Record.self, Init.self],

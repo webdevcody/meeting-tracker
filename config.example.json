@@ -23,14 +23,5 @@
       "/absolute/path/to/meet/hooks/summarize-transcript.sh"
     ],
     "env": {}
-  },
-
-  "agent": {
-    "model": "default",
-    "onDone": [
-      "Before you finish: find the GitHub issue for \"{{title}}\" with `gh issue list --search`;",
-      "if there is one, comment a three-line summary of what you changed on branch {{branch}} with `gh issue comment`.",
-      "If there is none, append the same summary to {{repo}}/CHANGES.md instead."
-    ]
   }
 }

@@ -77,10 +77,10 @@ pub fn system_prompt(ctx: &AskContext) -> String {
 
 The transcript is at {transcript}: one line per sentence as it was heard, `[mm:ss] source: text`, appended while the meeting goes on. Sources: "mic" is this Mac's microphone (the developer and anyone in the room), "system" is audio the Mac played (remote call participants, videos), "typed" is a note typed into meet. Expect recognition errors, filler words and half sentences; read through them.
 
-The running summary is at {summary}: the recording state and length, the meeting's summary once written, meet's one-line summaries per minute of talk — under each, what it looked up in the repository and earlier meetings that bears on it, the contradictions it noticed (⚠) and the questions it suggested asking (?) — and the action items on its board.
+The running summary is at {summary}: the recording state and length, and the meeting's summary and write-up once the recording has stopped and they are written.
 
 Rules:
-- Before answering ANY question, Read {transcript} again from the top — it has grown since you last looked; never answer from memory of an earlier read. Read {summary} when the question is about what meet concluded, the action items, or how long things have run.
+- Before answering ANY question, Read {transcript} again from the top — it has grown since you last looked; never answer from memory of an earlier read. Read {summary} when the question is about what meet concluded or how long things have run.
 - When the question is about the code, use Glob, Grep and Read on the repository at {repo}. Do not edit files, run builds or tests, commit, or take any other action: this session is for answers. If asked to draft something (a message, a list, a summary), write it in your reply, not into a file, unless a file is asked for.
 - Answer in plain prose, briefly — under about 150 words unless asked for more; you are read in a narrow pane beside the transcript. Quote the transcript line (with its [mm:ss]) that supports what you say, and say plainly when the transcript does not answer the question. Do not invent what was not said."#,
         repo = ctx.repo.display(),
@@ -216,15 +216,11 @@ pub fn ensure_files(store: &Store, m: &MeetingRow, ctx: &AskContext) -> Result<(
             text: s.text.clone(),
         })?;
     }
-    let chunks = store.list_chunks(&m.id)?;
-    let items = store.list_items(&ctx.repo.to_string_lossy())?;
     files.write_summary(&live::past_summary_text(
         m,
         &crate::git::repo_name(&ctx.repo),
         &files.transcript_path(),
         segments.len(),
-        &chunks,
-        &items,
     ))
 }
 
@@ -319,16 +315,6 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let id = store.insert_meeting("/w/my-app").unwrap();
         store.insert_segment(&id, "mic", "hello there", 1.0, 2.0).unwrap();
-        let c = store.insert_chunk(&id, 0, 1.0, 2.0, "hello there").unwrap();
-        store
-            .set_chunk_lookup(
-                &c,
-                &crate::lookup::Lookup {
-                    summary: "a greeting".into(),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
         store.set_meeting_summary(&id, "Someone said hello.").unwrap();
         store.end_meeting(&id, 1).unwrap();
         let row = store.list_meetings("/w/my-app").unwrap().remove(0);
@@ -344,7 +330,6 @@ mod tests {
         let s = std::fs::read_to_string(ctx.summary()).unwrap();
         assert!(s.contains("state: ended"), "{s}");
         assert!(s.contains("## Meeting summary\nSomeone said hello.\n"), "{s}");
-        assert!(s.contains("[1] 00:01–00:02 a greeting\n"), "{s}");
         // The meeting ended: every call writes the definitive files from the database.
         std::fs::write(ctx.transcript(), "stale\n").unwrap();
         std::fs::write(ctx.summary(), "stale\n").unwrap();

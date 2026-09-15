@@ -1,8 +1,7 @@
-//! The adjustable layout, done the way nebula does it: every seam between two panes can
-//! be dragged with the mouse (the columns' seam, the transcript/summary seam, the
-//! items/prompt seam), the shares are kept in `layout.json` in the data directory, and
-//! what was drawn where on the last frame is kept for the clicks — a session tab, a
-//! summary, an action item, a pane — to land on the right thing.
+//! The adjustable layout, done the way nebula does it: the seam between the transcript and
+//! the right pane can be dragged with the mouse, its share is kept in `layout.json` in the
+//! data directory, and what was drawn where on the last frame is kept for the clicks — a
+//! session tab, a pane — to land on the right thing.
 //!
 //! The pure parts live here: the splits, the hit-testing, the drag arithmetic. `ui`
 //! fills the hit map while drawing; the event loop asks it what the mouse is on.
@@ -16,29 +15,20 @@ use std::path::{Path, PathBuf};
 pub const FILE: &str = "layout.json";
 /// A column keeps at least this many cells, so neither side can be dragged shut.
 pub const MIN_COL_W: u16 = 24;
-/// A pane keeps at least this many rows: its border and two lines.
-pub const MIN_PANE_H: u16 = 4;
 
-/// Where the seams sit, as shares of the space they split — a share survives a terminal
+/// Where the seam sits, as a share of the width it splits — a share survives a terminal
 /// resize where a cell count would not.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LayoutPrefs {
     /// The left column's share of the body width.
     pub left: f64,
-    /// The transcript's share of the left column's height.
-    pub transcript: f64,
-    /// The action-item list's share of the right column's height; `None` sizes it to the
-    /// items shown (the default, until the seam is dragged).
-    pub items: Option<f64>,
 }
 
 impl Default for LayoutPrefs {
     fn default() -> Self {
         Self {
             left: 0.46,
-            transcript: 0.62,
-            items: None,
         }
     }
 }
@@ -86,19 +76,9 @@ impl LayoutPrefs {
 
     /// A hand-edited or damaged file never yields a share outside 0..1 (or NaN).
     fn sanitize(&mut self) {
-        let d = LayoutPrefs::default();
-        let fix = |v: f64, fallback: f64| {
-            if v.is_finite() && (0.0..=1.0).contains(&v) {
-                v
-            } else {
-                fallback
-            }
-        };
-        self.left = fix(self.left, d.left);
-        self.transcript = fix(self.transcript, d.transcript);
-        self.items = self
-            .items
-            .filter(|v| v.is_finite() && (0.0..=1.0).contains(v));
+        if !(self.left.is_finite() && (0.0..=1.0).contains(&self.left)) {
+            self.left = LayoutPrefs::default().left;
+        }
     }
 }
 
@@ -131,22 +111,6 @@ pub fn split_cols(body: Rect, left_share: f64) -> (Rect, Rect) {
     )
 }
 
-/// A column split into a top and a bottom pane.
-pub fn split_rows(col: Rect, top_share: f64) -> (Rect, Rect) {
-    let top_h = split_at(col.height, top_share, MIN_PANE_H);
-    (
-        Rect {
-            height: top_h,
-            ..col
-        },
-        Rect {
-            y: col.y + top_h,
-            height: col.height - top_h,
-            ..col
-        },
-    )
-}
-
 /// The share that puts a seam at `pos` inside a span starting at `start` and `len` long,
 /// each side keeping `min` when the span allows: the inverse of the splits, so a dragged
 /// seam lands under the pointer, and what is kept is what is shown.
@@ -170,16 +134,6 @@ pub fn share_at(start: u16, len: u16, pos: i32, min: u16) -> f64 {
 pub enum Splitter {
     /// Between the left and the right column.
     Columns,
-    /// Between the transcript and the summaries.
-    LeftRows,
-    /// Between the action items and the prompt (Items only).
-    RightRows,
-}
-
-impl Splitter {
-    pub fn is_vertical(self) -> bool {
-        self == Splitter::Columns
-    }
 }
 
 /// An in-progress drag of a seam.
@@ -198,7 +152,6 @@ pub enum PointerShape {
     #[default]
     Default,
     ColResize,
-    RowResize,
 }
 
 impl PointerShape {
@@ -206,7 +159,6 @@ impl PointerShape {
         match self {
             PointerShape::Default => "default",
             PointerShape::ColResize => "col-resize",
-            PointerShape::RowResize => "row-resize",
         }
     }
 }
@@ -224,18 +176,10 @@ pub struct HitMap {
     pub transcript: Rect,
     /// The transcript's text, inside its border: a drag there selects, and copies.
     pub transcript_text: Rect,
-    pub summaries: Rect,
-    /// Each summary's rows in the Summary pane, with its index in the shown chunks.
-    pub summary_rows: Vec<(Rect, usize)>,
     /// The whole right column.
     pub right: Rect,
     /// The right pane's tabs on its top border.
     pub right_tabs: Vec<(Rect, RightPane)>,
-    /// The action-item list and the prompt under it, while the right pane is Items.
-    pub items: Option<Rect>,
-    /// Each action item's row, with its index in the visible items.
-    pub item_rows: Vec<(Rect, usize)>,
-    pub detail: Option<Rect>,
     /// The open overlay's box: a click outside it closes the overlay.
     pub overlay: Option<Rect>,
     /// Rows inside the overlay that a click picks (the session list, the settings).
@@ -252,15 +196,9 @@ pub enum HitTarget {
     /// The session bar: a tab (its index in `app.sessions`), or the bar's own room.
     Bar(Option<usize>),
     Transcript,
-    /// The Summary pane: a summary (its index in the shown chunks), or empty room.
-    Summaries(Option<usize>),
     /// A tab on the right pane's top border.
     RightTab(RightPane),
-    /// The action-item list: a row (its index in the visible items), or empty room.
-    Items(Option<usize>),
-    /// The prompt under the action items.
-    Detail,
-    /// The rest of the right column: Related, the meeting summary, Claude Code.
+    /// The rest of the right column: the meeting summary, Claude Code.
     Right,
     /// Inside the open overlay: a row it lists, or its own room.
     Overlay(Option<usize>),
@@ -275,7 +213,8 @@ fn row_at(rows: &[(Rect, usize)], p: Position) -> Option<usize> {
 }
 
 impl HitMap {
-    /// Whether `(x, y)` is on a seam's two touching border cells — a column's, or a row's.
+    /// Whether `(x, y)` is on the seam's two touching border cells: the left pane's right
+    /// border, or the right pane's left border.
     pub fn splitter_at(&self, x: u16, y: u16) -> Option<Splitter> {
         let body = self.body;
         if body.width == 0 || body.height == 0 {
@@ -287,38 +226,14 @@ impl HitMap {
         if in_rows && seam > body.x && x.saturating_add(1) >= seam && x <= seam {
             return Some(Splitter::Columns);
         }
-        let left = self.transcript;
-        let seam = self.summaries.y;
-        if seam > left.y
-            && x >= left.x
-            && x < left.right()
-            && y.saturating_add(1) >= seam
-            && y <= seam
-        {
-            return Some(Splitter::LeftRows);
-        }
-        if let Some(detail) = self.detail {
-            let seam = detail.y;
-            let right = self.right;
-            if seam > right.y
-                && x >= right.x
-                && x < right.right()
-                && y.saturating_add(1) >= seam
-                && y <= seam
-            {
-                return Some(Splitter::RightRows);
-            }
-        }
         None
     }
 
-    /// Where the seam `which` sits now: the screen column (Columns) or row (the others)
-    /// of the cell where the second pane starts.
+    /// Where the seam `which` sits now: the screen column of the cell where the second
+    /// pane starts.
     pub fn seam_pos(&self, which: Splitter) -> i32 {
         match which {
             Splitter::Columns => i32::from(self.right.x),
-            Splitter::LeftRows => i32::from(self.summaries.y),
-            Splitter::RightRows => i32::from(self.detail.map_or(0, |d| d.y)),
         }
     }
 
@@ -345,15 +260,6 @@ impl HitMap {
         }
         if self.transcript.contains(p) {
             return HitTarget::Transcript;
-        }
-        if self.summaries.contains(p) {
-            return HitTarget::Summaries(row_at(&self.summary_rows, p));
-        }
-        if self.items.is_some_and(|r| r.contains(p)) {
-            return HitTarget::Items(row_at(&self.item_rows, p));
-        }
-        if self.detail.is_some_and(|r| r.contains(p)) {
-            return HitTarget::Detail;
         }
         if self.right.contains(p) {
             return HitTarget::Right;
@@ -385,19 +291,6 @@ mod tests {
             (15, 15),
             "too narrow for two minimums: halved"
         );
-    }
-
-    #[test]
-    fn the_rows_split_the_same_way() {
-        let col = Rect::new(5, 2, 40, 20);
-        let (t, b) = split_rows(col, 0.62);
-        assert_eq!((t.y, t.height), (2, 12));
-        assert_eq!((b.y, b.height), (14, 8));
-        assert_eq!((t.x, t.width), (5, 40));
-        let (t, _) = split_rows(col, 0.0);
-        assert_eq!(t.height, MIN_PANE_H);
-        let (_, b) = split_rows(col, 1.0);
-        assert_eq!(b.height, MIN_PANE_H);
     }
 
     #[test]
@@ -436,19 +329,15 @@ mod tests {
             LayoutPrefs::load_from(&path).unwrap(),
             LayoutPrefs::default()
         );
-        let prefs = LayoutPrefs {
-            left: 0.3,
-            transcript: 0.5,
-            items: Some(0.4),
-        };
+        let prefs = LayoutPrefs { left: 0.3 };
         prefs.save_to(&path).unwrap();
         assert_eq!(LayoutPrefs::load_from(&path).unwrap(), prefs);
         assert!(!dir.path().join("deep").join("layout.json.tmp").exists());
-        std::fs::write(&path, r#"{"left": 7.0, "transcript": -1, "items": 1.5}"#).unwrap();
+        // An older file still carries the summaries' and the action-item list's shares: they
+        // are ignored.
+        std::fs::write(&path, r#"{"left": 7.0, "transcript": 0.5, "items": 0.4}"#).unwrap();
         let loaded = LayoutPrefs::load_from(&path).unwrap();
-        assert_eq!(loaded.left, LayoutPrefs::default().left);
-        assert_eq!(loaded.transcript, LayoutPrefs::default().transcript);
-        assert_eq!(loaded.items, None);
+        assert_eq!(loaded, LayoutPrefs::default());
         std::fs::write(&path, "{").unwrap();
         assert!(LayoutPrefs::load_from(&path).is_err());
     }
@@ -456,25 +345,15 @@ mod tests {
     fn map() -> HitMap {
         // A 100×40 screen: header row 0, bar row 1, body rows 2..38, footer row 39.
         let body = Rect::new(0, 2, 100, 37);
-        let (left, right) = split_cols(body, 0.46);
-        let (transcript, summaries) = split_rows(left, 0.62);
-        let (items, detail) = split_rows(right, 0.4);
+        let (transcript, right) = split_cols(body, 0.46);
         HitMap {
             body,
             bar: Rect::new(0, 1, 100, 1),
             bar_tabs: vec![(Rect::new(10, 1, 8, 1), 0), (Rect::new(19, 1, 13, 1), 1)],
             transcript,
             transcript_text: Rect::default(),
-            summaries,
-            summary_rows: vec![
-                (Rect::new(1, summaries.y + 1, 44, 2), 0),
-                (Rect::new(1, summaries.y + 3, 44, 1), 1),
-            ],
             right,
             right_tabs: vec![(Rect::new(80, 2, 7, 1), RightPane::Summary)],
-            items: Some(items),
-            item_rows: vec![(Rect::new(47, items.y + 1, 52, 1), 0)],
-            detail: Some(detail),
             overlay: None,
             overlay_rows: Vec::new(),
             sources: vec![(Rect::new(80, 0, 6, 1), 0), (Rect::new(89, 0, 9, 1), 1)],
@@ -499,34 +378,12 @@ mod tests {
         assert_eq!(m.splitter_at(47, 10), None);
         assert_eq!(m.splitter_at(46, 1), None, "not on the bar");
         assert_eq!(m.splitter_at(46, 39), None, "not on the footer");
-        let seam = m.summaries.y;
-        assert_eq!(m.splitter_at(10, seam - 1), Some(Splitter::LeftRows));
-        assert_eq!(m.splitter_at(10, seam), Some(Splitter::LeftRows));
-        assert_eq!(m.splitter_at(10, seam + 1), None);
         assert_eq!(
-            m.splitter_at(60, seam),
+            m.splitter_at(10, m.transcript.bottom() - 1),
             None,
-            "the right column has its own seam"
-        );
-        let seam = m.detail.unwrap().y;
-        assert_eq!(m.splitter_at(60, seam - 1), Some(Splitter::RightRows));
-        assert_eq!(m.splitter_at(60, seam), Some(Splitter::RightRows));
-        assert_eq!(
-            m.splitter_at(45, seam),
-            Some(Splitter::Columns),
-            "where seams cross, the columns' wins"
+            "the transcript's bottom border is no seam"
         );
         assert_eq!(m.seam_pos(Splitter::Columns), 46);
-        assert_eq!(m.seam_pos(Splitter::LeftRows), i32::from(m.summaries.y));
-        assert_eq!(m.seam_pos(Splitter::RightRows), i32::from(seam));
-        let mut no_items = map();
-        no_items.detail = None;
-        no_items.items = None;
-        assert_eq!(
-            no_items.splitter_at(60, seam),
-            None,
-            "no prompt pane, no seam"
-        );
     }
 
     #[test]
@@ -537,14 +394,8 @@ mod tests {
         assert_eq!(m.hit_at(3, 1), HitTarget::Bar(None), "the bar's label");
         assert_eq!(m.hit_at(82, 2), HitTarget::RightTab(RightPane::Summary));
         assert_eq!(m.hit_at(10, 5), HitTarget::Transcript);
-        let sy = m.summaries.y;
-        assert_eq!(m.hit_at(10, sy + 2), HitTarget::Summaries(Some(0)));
-        assert_eq!(m.hit_at(10, sy + 3), HitTarget::Summaries(Some(1)));
-        assert_eq!(m.hit_at(10, sy + 6), HitTarget::Summaries(None));
-        let iy = m.items.unwrap().y;
-        assert_eq!(m.hit_at(60, iy + 1), HitTarget::Items(Some(0)));
-        assert_eq!(m.hit_at(60, iy + 2), HitTarget::Items(None));
-        assert_eq!(m.hit_at(60, m.detail.unwrap().y + 2), HitTarget::Detail);
+        assert_eq!(m.hit_at(10, 30), HitTarget::Transcript, "down the whole left column");
+        assert_eq!(m.hit_at(60, 20), HitTarget::Right);
         assert_eq!(m.hit_at(0, 0), HitTarget::Outside, "the header");
         assert_eq!(
             m.hit_at(82, 0),
@@ -558,10 +409,6 @@ mod tests {
         );
         assert_eq!(m.hit_at(87, 0), HitTarget::Outside, "the gap between them");
         assert_eq!(m.hit_at(50, 39), HitTarget::Outside, "the footer");
-        let mut plain = map();
-        plain.items = None;
-        plain.detail = None;
-        assert_eq!(plain.hit_at(60, 20), HitTarget::Right);
     }
 
     #[test]
@@ -580,8 +427,5 @@ mod tests {
     fn pointer_shapes_have_their_css_names() {
         assert_eq!(PointerShape::Default.osc_name(), "default");
         assert_eq!(PointerShape::ColResize.osc_name(), "col-resize");
-        assert_eq!(PointerShape::RowResize.osc_name(), "row-resize");
-        assert!(Splitter::Columns.is_vertical());
-        assert!(!Splitter::LeftRows.is_vertical());
     }
 }

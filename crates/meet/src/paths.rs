@@ -1,6 +1,5 @@
-//! Where `meet` keeps its own state: one SQLite database, one directory of agent run logs
-//! and one directory of live meeting files per user, like nebula — never inside the
-//! repository being worked on.
+//! Where `meet` keeps its own state: one SQLite database and one directory of live meeting
+//! files per user, like nebula — never inside the repository being worked on.
 //! `MEET_DATA_DIR` overrides everything (tests, a second instance).
 
 use std::path::PathBuf;
@@ -28,15 +27,6 @@ pub fn db_path() -> PathBuf {
     data_dir().join("meet.db")
 }
 
-/// One directory per agent run: the human-readable log, the raw stream, the PR text.
-pub fn runs_dir() -> PathBuf {
-    data_dir().join("runs")
-}
-
-pub fn run_dir(item_id: &str) -> PathBuf {
-    runs_dir().join(item_id)
-}
-
 /// One directory per meeting: the live transcript and the running summary, written as
 /// the meeting goes for anything outside the TUI (the question session) to read.
 pub fn sessions_dir() -> PathBuf {
@@ -58,7 +48,6 @@ mod tests {
         std::env::set_var(DATA_DIR_ENV, &dir);
         assert_eq!(data_dir(), dir);
         assert_eq!(db_path(), dir.join("meet.db"));
-        assert_eq!(run_dir("abc"), dir.join("runs").join("abc"));
         assert_eq!(session_dir("m1"), dir.join("sessions").join("m1"));
         match previous {
             Some(v) => std::env::set_var(DATA_DIR_ENV, v),

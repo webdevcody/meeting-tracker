@@ -3,8 +3,8 @@
 # Ways to run code you just wrote (the shape is nebula's Makefile, minus what its daemon needs):
 #   make dev      build and launch the latest code in an isolated instance — its own data
 #                 dir, so the meetings you try land nowhere near the real ones (the first
-#                 run copies your real sessions, board and settings in, so the session bar
-#                 and the Related pane look like yours; `make dev-reset` re-copies)
+#                 run copies your real sessions and settings in, so the session bar
+#                 and the summaries look like yours; `make dev-reset` re-copies)
 #   make install  release build of both binaries, symlinked into ~/.local/bin for real use
 #   make cycle    install + dev in one go — the re-runnable full cutover
 #
@@ -65,15 +65,13 @@ dev-prep: engine
 	@$(if $(filter 0,$(SEED)),true,$(MAKE) --no-print-directory dev-seed)
 
 # A blank dev instance is useless for eyeballing a change: no session bar, nothing earlier
-# for the Related pane to draw on. So the first `make dev` copies the real database, live
-# files and settings in, minus what the real `meet` owns right now: the meeting it is
-# recording (ended_at IS NULL — the dev instance must not show it as live or answer `ask`
-# from it) and its running agents (set to stopped, as `--no-resume` does, so nothing here
-# resumes a real Claude session in a real worktree). `.backup` reads the WAL, so the copy
-# is consistent while the real meet runs. The real dir is where
+# for the Summary pane to show. So the first `make dev` copies the real database, live
+# files and settings in, minus the meeting the real `meet` is recording right now
+# (ended_at IS NULL — the dev instance must not show it as live or answer `ask` from it).
+# `.backup` reads the WAL, so the copy is consistent while the real meet runs. The real dir is where
 # `directories::ProjectDirs::from("dev","meet","meet")` puts it (crates/meet/src/paths.rs);
 # keep the two in step.
-dev-seed: ## Copy the real sessions, board and settings into the dev instance (only if it has none yet)
+dev-seed: ## Copy the real sessions and settings into the dev instance (only if it has none yet)
 	@[ ! -e '$(DEV_DATA)/meet.db' ] || exit 0; \
 	case "$$(uname -s)" in \
 		Darwin) real="$$HOME/Library/Application Support/dev.meet.meet";; \
@@ -86,11 +84,10 @@ dev-seed: ## Copy the real sessions, board and settings into the dev instance (o
 	mkdir -p '$(DEV_DATA)'; \
 	sqlite3 "$$real/meet.db" ".backup '$(DEV_DATA)/meet.db'"; \
 	sqlite3 '$(DEV_DATA)/meet.db' "PRAGMA foreign_keys = ON; \
-		DELETE FROM meetings WHERE ended_at IS NULL; \
-		UPDATE action_items SET status = 'stopped' WHERE status = 'running';"; \
+		DELETE FROM meetings WHERE ended_at IS NULL;"; \
 	[ ! -d "$$real/sessions" ] || cp -R "$$real/sessions" '$(DEV_DATA)/'; \
 	[ ! -f "$$real/settings.json" ] || cp "$$real/settings.json" '$(DEV_DATA)/'; \
-	echo "seeded dev instance from $$real (sessions, board, settings — not the meeting being recorded now)"
+	echo "seeded dev instance from $$real (sessions and settings — not the meeting being recorded now)"
 
 dev-reset: ## Wipe this checkout's dev data; the next `make dev` re-seeds it
 	rm -rf '$(DEV_DATA)'
@@ -145,9 +142,9 @@ test: ## Unit tests and clippy
 	cargo test
 	cargo clippy --all-targets -- -D warnings
 
-# Drive the TUI through stop / resume / quit-and-resume / session browsing in tmux, against a
-# fake claude and a fake gh (no API calls, no real pull requests). Needs tmux.
-e2e: tui ## The tmux end-to-end run against a fake claude and gh
+# Drive the TUI through recording, stopping, session browsing, the question session and the
+# settings in tmux, against a fake claude (no API calls). Needs tmux.
+e2e: tui ## The tmux end-to-end run against a fake claude
 	bash crates/meet/testdata/e2e/drive.sh
 
 # Replay the bundled demo transcript against this checkout (no microphone needed) — the
